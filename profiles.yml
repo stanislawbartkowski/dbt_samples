@@ -7,6 +7,6 @@ dbt_utils_demo:
       user: dbt
       password: secret
       dbname: dbt_edu
-      schema: dbt_utils_demo
+      schema: dbt_execute_guard
       threads: 1
   target: dev

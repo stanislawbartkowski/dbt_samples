@@ -1,6 +1,81 @@
-# dbt_utils_demo
+# dbt_utils_demo: side effects behind `{% if execute %}`
 
-A small dbt v2 project for Postgres. It loads a `customers` seed and builds a `customer_full_names` view with dbt's `concat` macro. The project overrides `concat` to join fields with `' - '`. The `dbt_utils` package is installed as a dependency.
+This branch shows why `{% if execute %}` doesn't stop a macro's side effects from running during `dbt compile`, `dbt docs generate` or `dbt show`, and how to limit them to `run` and `build` with `flags.WHICH`.
+
+This branch uses the same dbt v2, Postgres and uv setup as [`concat_macro_overrides`](https://github.com/stanislawbartkowski/dbt_samples/tree/concat_macro_overrides), without the `concat` override. See [Setup](#setup) below.
+
+## The problem
+
+> "A macro wrapped in `{% if execute %}` still runs a `DELETE` during the nightly `dbt docs generate`, and it wipes a staging table nobody meant to touch."
+
+`execute` doesn't mean "dbt is materializing models". It is `False` only while dbt reads the project (parse). It is `True` every time dbt compiles SQL with a live database connection: `run` and `build`, but also `compile`, `show` and `docs generate`, which compiles by default. A guard on `execute` alone can't tell real runs from compiling for docs.
+
+## The example
+
+Two seeds, `scratch_naive` and `scratch_safe`, each hold 3 rows. Two models call a cleanup macro that deletes from one of them. The only difference is the guard (`macros/cleanup_scratch.sql`):
+
+```sql
+{# BROKEN #}
+{% macro cleanup_scratch_naive() %}
+  {% if execute %}
+    {% do run_query("delete from " ~ ref('scratch_naive')) %}
+  {% endif %}
+{% endmacro %}
+
+{# FIXED #}
+{% macro cleanup_scratch_safe() %}
+  {% if execute and flags.WHICH in ['run', 'build'] %}
+    {% call statement('cleanup_scratch_safe', fetch_result=False) %}
+      delete from {{ ref('scratch_safe') }}
+    {% endcall %}
+  {% endif %}
+{% endmacro %}
+```
+
+Both macros also log `DELETE fired during '<command>'`, so you can see when the delete runs.
+
+### Reproduce it
+
+```bash
+source .venv/bin/activate
+set -a; source env_standard; set +a
+export DBT_PROFILES_DIR=.
+
+dbt deps
+dbt seed                          # both scratch tables: 3 rows
+dbt run-operation scratch_counts  # scratch_naive: 3 rows, scratch_safe: 3 rows
+
+dbt docs generate                 # log: cleanup_scratch_naive: DELETE fired during 'compile'
+dbt run-operation scratch_counts  # scratch_naive: 0 rows, scratch_safe: 3 rows
+```
+
+Run `dbt seed` again to restore the rows before trying the next command.
+
+### What each command does (dbt 2.0.8, Postgres)
+
+| Command | `execute` | `flags.WHICH` | `scratch_naive` | `scratch_safe` |
+| --- | --- | --- | --- | --- |
+| `dbt parse`, `dbt ls` | `False` | `parse` / `list` | kept | kept |
+| `dbt compile` | `True` | `compile` | **deleted** | kept |
+| `dbt docs generate` | `True` | `compile` | **deleted** | kept |
+| `dbt show -s customers_naive_cleanup` | `True` | `show` | **deleted** | kept |
+| `dbt docs generate --no-compile` | – | – | kept | kept |
+| `dbt run`, `dbt build` | `True` | `run` / `build` | deleted (intended) | deleted (intended) |
+
+In dbt v2, `dbt docs generate` reports `flags.WHICH == 'compile'`, not `'generate'`, so a guard that only excludes `'generate'` would still delete. Allow the commands you want (`['run', 'build']`) rather than excluding the ones you don't.
+
+## Notes
+
+- **Prefer `statement(..., fetch_result=False)` for DML and DDL.** It says the result isn't needed. In this setup (dbt 2.0.8, Postgres), `run_query` also ran the `DELETE` without errors, so either works here.
+- **A `ref()` inside `{% if %}` needs `-- depends_on:`.** dbt v2 rejects a `ref()` that only runs inside a conditional (`unable to infer all dependencies`). Each model declares the dependency with a comment at the top:
+
+  ```sql
+  -- depends_on: {{ ref('scratch_naive') }}
+  {{ cleanup_scratch_naive() }}
+  ```
+
+- **Add `--no-compile` to scheduled docs jobs** if they only need the catalog. It also skips every compile-time side effect.
+- **Better still, keep side effects out of model SQL.** Write the `DELETE` as plain SQL in a hook (`pre_hook="delete from {{ ref('scratch_safe') }}"`). dbt runs hook SQL only during `run` and `build`; this setup confirmed it doesn't run during `compile`, `show` or `docs generate`. Watch out: dbt v2 still renders the hook's Jinja during `compile`, so a `run_query` *inside* a hook would fire there. For one-off maintenance, use `dbt run-operation`.
 
 ## Project layout
 
@@ -8,11 +83,14 @@ A small dbt v2 project for Postgres. It loads a `customers` seed and builds a `c
 | --- | --- |
 | `seeds/customers.csv` | Sample customer data loaded with `dbt seed` |
 | `models/customer_full_names.sql` | View that combines first and last name into `full_name` |
-| `macros/concat.sql` | Overrides `dbt.concat` on Postgres to join fields with `' - '` |
+| `seeds/scratch_naive.csv`, `seeds/scratch_safe.csv` | Scratch tables that the cleanup macros delete from |
+| `macros/cleanup_scratch.sql` | `cleanup_scratch_naive` (broken guard) and `cleanup_scratch_safe` (fixed guard) |
+| `macros/scratch_counts.sql` | `dbt run-operation scratch_counts` prints the row count of each scratch table |
+| `models/customers_naive_cleanup.sql`, `models/customers_safe_cleanup.sql` | Models that call the cleanup macros |
 | `packages.yml` | dbt package dependencies (`dbt-labs/dbt_utils` 1.x) |
 | `pyproject.toml` / `uv.lock` | Python environment; pins `dbt==2.0.8` |
 | `env_standard` | Environment variables the project needs (see below) |
-| `profiles.yml` | Connection settings for a local Postgres (generic `dbt` / `secret` credentials) |
+| `profiles.yml` | Connection settings for a local Postgres (generic `dbt` / `secret` credentials), schema `dbt_execute_guard` |
 
 ## Prerequisites
 
@@ -41,7 +119,7 @@ A small dbt v2 project for Postgres. It loads a `customers` seed and builds a `c
          user: dbt
          password: secret   # dbt v2 requires `password`, not `pass`
          dbname: dbt_edu
-         schema: dbt_utils_demo
+         schema: dbt_execute_guard
          threads: 1
    ```
 
@@ -101,43 +179,12 @@ uv run --env-file env_standard dbt show --profiles-dir . --select customer_full_
 Output (first rows):
 
 ```
-│ customer_id ┆ first_name ┆ last_name ┆ full_name     │
-╞═════════════╪════════════╪═══════════╪═══════════════╡
-│ 1           ┆ John       ┆ Doe       ┆ John - Doe    │
-│ 2           ┆ Jane       ┆ Smith     ┆ Jane - Smith  │
-│ 3           ┆ Alice      ┆ Brown     ┆ Alice - Brown │
+│ customer_id ┆ first_name ┆ last_name ┆ full_name   │
+╞═════════════╪════════════╪═══════════╪═════════════╡
+│ 1           ┆ John       ┆ Doe       ┆ John Doe    │
+│ 2           ┆ Jane       ┆ Smith     ┆ Jane Smith  │
+│ 3           ┆ Alice      ┆ Brown     ┆ Alice Brown │
 ```
-
-### Custom `concat` separator
-
-`macros/concat.sql` defines `postgres__concat`. dbt checks this project's macros before its own, so every `dbt.concat([...])` call joins its fields with `' - '`:
-
-```sql
-{{ dbt.concat(['first_name', 'last_name']) }}   -- compiles to: first_name || ' - ' || last_name
-```
-
-#### How the override works
-
-dbt's built-in `concat` doesn't contain any SQL. It passes the call to a database-specific macro:
-
-```sql
-{% macro concat(fields) %}
-  {{ return(adapter.dispatch('concat', 'dbt')(fields)) }}
-{% endmacro %}
-```
-
-On Postgres, dbt looks for these macros in order and uses the first one it finds:
-
-1. `postgres__concat` in **this project** ← our override
-2. `default__concat` in **this project**
-3. `postgres__concat` in **dbt**
-4. `default__concat` in **dbt**
-
-This project defines `postgres__concat`, so dbt uses it and never calls its own version. Models don't need any changes: they still call `dbt.concat`. To make the override apply on every database, not just Postgres, name the macro `default__concat` instead.
-
-Run `dbt compile -s customer_full_names` to see the SQL it produces.
-
-The override also applies inside packages: `dbt_utils.generate_surrogate_key` produces different hashes than it would with dbt's default `concat`. It also changes null handling. The override uses `||`, so if any field is null, the result is null. dbt's default `concat` skips nulls instead.
 
 `dbt show` returns 10 rows by default. Use `--limit 20` to change that, or `--limit -1` to show all rows.
 
