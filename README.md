@@ -12,7 +12,7 @@ A small dbt v2 project for Postgres. It loads a `customers` seed and builds a `c
 | `packages.yml` | dbt package dependencies (`dbt-labs/dbt_utils` 1.x) |
 | `pyproject.toml` / `uv.lock` | Python environment; pins `dbt==2.0.8` |
 | `env_standard` | Environment variables the project needs (see below) |
-| `profiles.yml` | Your connection settings. Git ignores it; you create it yourself |
+| `profiles.yml` | Connection settings for a local Postgres (generic `dbt` / `secret` credentials) |
 
 ## Prerequisites
 
@@ -28,7 +28,7 @@ A small dbt v2 project for Postgres. It loads a `customers` seed and builds a `c
    uv run dbt --version   # dbt 2.0.8
    ```
 
-2. **Create `profiles.yml`** in the project root:
+2. **Check `profiles.yml`.** It is included and points to a local Postgres with generic credentials. If your database is set up differently, change these settings:
 
    ```yaml
    dbt_utils_demo:
@@ -39,7 +39,7 @@ A small dbt v2 project for Postgres. It loads a `customers` seed and builds a `c
          host: localhost
          port: 5432
          user: dbt
-         password: <your-password>   # dbt v2 requires `password`, not `pass`
+         password: secret   # dbt v2 requires `password`, not `pass`
          dbname: dbt_edu
          schema: dbt_utils_demo
          threads: 1
