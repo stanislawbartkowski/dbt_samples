@@ -2,7 +2,7 @@
 
 This branch shows how Jinja whitespace control, or the lack of it, breaks the SQL that dbt compiles. The examples are in `models/jinja_whitespace/`. Each broken model has a `_fixed` version next to it.
 
-This branch builds on [`concat_macro_overrides`](https://github.com/stanislawbartkowski/dbt_samples/tree/concat_macro_overrides). Setup is identical, so see [Setup](#setup) below.
+This branch uses the same dbt v2, Postgres and uv setup as [`concat_macro_overrides`](https://github.com/stanislawbartkowski/dbt_samples/tree/concat_macro_overrides), without the `concat` override. See [Setup](#setup) below.
 
 ## The problem
 
@@ -152,7 +152,6 @@ dbt show -s comment_eats_sql --limit 1   # columns: customer_id, first_name (no 
 | --- | --- |
 | `seeds/customers.csv` | Sample customer data loaded with `dbt seed` |
 | `models/customer_full_names.sql` | View that combines first and last name into `full_name` |
-| `macros/concat.sql` | Overrides `dbt.concat` on Postgres to join fields with `' - '` |
 | `packages.yml` | dbt package dependencies (`dbt-labs/dbt_utils` 1.x) |
 | `pyproject.toml` / `uv.lock` | Python environment; pins `dbt==2.0.8` |
 | `env_standard` | Environment variables the project needs (see below) |
@@ -247,43 +246,12 @@ uv run --env-file env_standard dbt show --profiles-dir . --select customer_full_
 Output (first rows):
 
 ```
-│ customer_id ┆ first_name ┆ last_name ┆ full_name     │
-╞═════════════╪════════════╪═══════════╪═══════════════╡
-│ 1           ┆ John       ┆ Doe       ┆ John - Doe    │
-│ 2           ┆ Jane       ┆ Smith     ┆ Jane - Smith  │
-│ 3           ┆ Alice      ┆ Brown     ┆ Alice - Brown │
+│ customer_id ┆ first_name ┆ last_name ┆ full_name   │
+╞═════════════╪════════════╪═══════════╪═════════════╡
+│ 1           ┆ John       ┆ Doe       ┆ John Doe    │
+│ 2           ┆ Jane       ┆ Smith     ┆ Jane Smith  │
+│ 3           ┆ Alice      ┆ Brown     ┆ Alice Brown │
 ```
-
-### Custom `concat` separator
-
-`macros/concat.sql` defines `postgres__concat`. dbt checks this project's macros before its own, so every `dbt.concat([...])` call joins its fields with `' - '`:
-
-```sql
-{{ dbt.concat(['first_name', 'last_name']) }}   -- compiles to: first_name || ' - ' || last_name
-```
-
-#### How the override works
-
-dbt's built-in `concat` doesn't contain any SQL. It passes the call to a database-specific macro:
-
-```sql
-{% macro concat(fields) %}
-  {{ return(adapter.dispatch('concat', 'dbt')(fields)) }}
-{% endmacro %}
-```
-
-On Postgres, dbt looks for these macros in order and uses the first one it finds:
-
-1. `postgres__concat` in **this project** ← our override
-2. `default__concat` in **this project**
-3. `postgres__concat` in **dbt**
-4. `default__concat` in **dbt**
-
-This project defines `postgres__concat`, so dbt uses it and never calls its own version. Models don't need any changes: they still call `dbt.concat`. To make the override apply on every database, not just Postgres, name the macro `default__concat` instead.
-
-Run `dbt compile -s customer_full_names` to see the SQL it produces.
-
-The override also applies inside packages: `dbt_utils.generate_surrogate_key` produces different hashes than it would with dbt's default `concat`. It also changes null handling. The override uses `||`, so if any field is null, the result is null. dbt's default `concat` skips nulls instead.
 
 `dbt show` returns 10 rows by default. Use `--limit 20` to change that, or `--limit -1` to show all rows.
 
