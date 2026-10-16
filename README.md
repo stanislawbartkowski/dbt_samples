@@ -12,7 +12,7 @@ This branch uses the same dbt v2, Postgres and uv setup as [`concat_macro_overri
 
 ## The example
 
-Two seeds, `scratch_naive` and `scratch_safe`, each hold 3 rows. Two models call a cleanup macro that deletes from one of them. The only difference is the guard (`macros/cleanup_scratch.sql`):
+Two seeds, `scratch_naive` and `scratch_safe`, each hold 3 rows. Two models call a cleanup macro that deletes from one of them. The macros are identical except for one condition in the guard (`macros/cleanup_scratch.sql`):
 
 ```sql
 {# BROKEN #}
@@ -22,15 +22,15 @@ Two seeds, `scratch_naive` and `scratch_safe`, each hold 3 rows. Two models call
   {% endif %}
 {% endmacro %}
 
-{# FIXED #}
+{# FIXED: only the guard changes #}
 {% macro cleanup_scratch_safe() %}
   {% if execute and flags.WHICH in ['run', 'build'] %}
-    {% call statement('cleanup_scratch_safe', fetch_result=False) %}
-      delete from {{ ref('scratch_safe') }}
-    {% endcall %}
+    {% do run_query("delete from " ~ ref('scratch_safe')) %}
   {% endif %}
 {% endmacro %}
 ```
+
+Both checks are needed. dbt renders the macro twice in each command: first while reading the project (`execute` is `False`), then while compiling (`execute` is `True`). During `dbt run`, `flags.WHICH` is already `'run'` in the first pass. So `flags.WHICH` alone would fire the delete while dbt is still reading the project, and `execute` alone fires it in `compile`, `show` and `docs generate`.
 
 Both macros also log `DELETE fired during '<command>'`, so you can see when the delete runs.
 
@@ -66,7 +66,15 @@ In dbt v2, `dbt docs generate` reports `flags.WHICH == 'compile'`, not `'generat
 
 ## Notes
 
-- **Prefer `statement(..., fetch_result=False)` for DML and DDL.** It says the result isn't needed. In this setup (dbt 2.0.8, Postgres), `run_query` also ran the `DELETE` without errors, so either works here.
+- **Optional: `statement(..., fetch_result=False)` instead of `run_query`.** For DML and DDL you don't need a result set. `statement` skips fetching it and lets you write the SQL as a block:
+
+  ```sql
+  {% call statement('cleanup_scratch_safe', fetch_result=False) %}
+    delete from {{ ref('scratch_safe') }}
+  {% endcall %}
+  ```
+
+  This is a style choice, not part of the fix. In this setup (dbt 2.0.8, Postgres), `run_query` runs the `DELETE` without errors.
 - **A `ref()` inside `{% if %}` needs `-- depends_on:`.** dbt v2 rejects a `ref()` that only runs inside a conditional (`unable to infer all dependencies`). Each model declares the dependency with a comment at the top:
 
   ```sql

@@ -8,12 +8,11 @@
 {% endmacro %}
 
 
-{#- FIXED: run the side effect only for the commands that actually materialize models. -#}
+{#- FIXED: run the side effect only for the commands that actually materialize models.
+    The only change from cleanup_scratch_naive is `and flags.WHICH in ['run', 'build']`. -#}
 {% macro cleanup_scratch_safe() %}
   {% if execute and flags.WHICH in ['run', 'build'] %}
     {{ log("cleanup_scratch_safe: DELETE fired during '" ~ flags.WHICH ~ "'", info=true) }}
-    {% call statement('cleanup_scratch_safe', fetch_result=False) %}
-      delete from {{ ref('scratch_safe') }}
-    {% endcall %}
+    {% do run_query("delete from " ~ ref('scratch_safe')) %}
   {% endif %}
 {% endmacro %}
