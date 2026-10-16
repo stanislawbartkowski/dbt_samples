@@ -7,7 +7,7 @@ dbt_utils_demo:
       user: dbt
       password: secret
       dbname: dbt_edu
-      schema: dbt_utils_demo
+      schema: dbt_jinja_spaces
       threads: 1
     ci:
       type: postgres
@@ -16,6 +16,6 @@ dbt_utils_demo:
       user: dbt
       password: secret
       dbname: dbt_edu
-      schema: dbt_utils_demo_ci
+      schema: dbt_jinja_spaces_ci
       threads: 1
   target: dev

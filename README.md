@@ -64,7 +64,7 @@ select
     
     
 
-from "dbt_edu"."dbt_utils_demo_ci"."customers"
+from "dbt_edu"."dbt_jinja_spaces_ci"."customers"
 ```
 
 **Why "only in CI"?** Whitespace handling is deterministic, so the environment doesn't change how it behaves. CI runs with different inputs (here, `target.name`), which takes a different branch of the `if`. Without whitespace control, every tag leaves a blank line, so the dangling comma is buried in empty space and hard to spot.
@@ -87,7 +87,7 @@ from {{ ref('customers') }}
 select
     customer_id,
     first_name
-from "dbt_edu"."dbt_utils_demo_ci"."customers"
+from "dbt_edu"."dbt_jinja_spaces_ci"."customers"
 ```
 
 ### 2. Too much stripping: `glued_tokens`
@@ -103,7 +103,7 @@ from {{ ref('customers') }}
 ```
 
 ```sql
-selectcustomer_id,first_name,last_namefrom "dbt_edu"."dbt_utils_demo"."customers"
+selectcustomer_id,first_name,last_namefrom "dbt_edu"."dbt_jinja_spaces"."customers"
 ```
 
 ```bash
@@ -129,7 +129,7 @@ The `-%}` strips the line break after the tag, and that line break was what ende
 select
     customer_id,
     first_name -- optional columns below, last_name
-from "dbt_edu"."dbt_utils_demo"."customers"
+from "dbt_edu"."dbt_jinja_spaces"."customers"
 ```
 
 ```bash
@@ -156,7 +156,7 @@ dbt show -s comment_eats_sql --limit 1   # columns: customer_id, first_name (no 
 | `packages.yml` | dbt package dependencies (`dbt-labs/dbt_utils` 1.x) |
 | `pyproject.toml` / `uv.lock` | Python environment; pins `dbt==2.0.8` |
 | `env_standard` | Environment variables the project needs (see below) |
-| `profiles.yml` | Connection settings for a local Postgres (generic `dbt` / `secret` credentials). Targets: `dev` (default) and `ci` (schema `dbt_utils_demo_ci`) |
+| `profiles.yml` | Connection settings for a local Postgres (generic `dbt` / `secret` credentials). Targets: `dev` (default) and `ci` (schema `dbt_jinja_spaces_ci`) |
 | `models/jinja_whitespace/` | Whitespace-control demos: broken models and their `_fixed` versions |
 | `selectors.yml` | Default selector that excludes models tagged `broken` |
 
@@ -187,7 +187,7 @@ dbt show -s comment_eats_sql --limit 1   # columns: customer_id, first_name (no 
          user: dbt
          password: secret   # dbt v2 requires `password`, not `pass`
          dbname: dbt_edu
-         schema: dbt_utils_demo
+         schema: dbt_jinja_spaces
          threads: 1
    ```
 
