@@ -7,6 +7,7 @@ Small, self-contained dbt examples. Each example is a complete dbt project on it
 | Branch | What it shows |
 | --- | --- |
 | [`concat_macro_overrides`](https://github.com/stanislawbartkowski/dbt_samples/tree/concat_macro_overrides) | How to override a built-in dbt macro. The project replaces `dbt.concat` with its own `postgres__concat`, which joins fields with `' - '`, so `first_name`, `last_name` becomes `John - Doe`. The example runs on dbt v2 and Postgres, and is set up with uv. |
+| [`jinja_whitespace_control`](https://github.com/stanislawbartkowski/dbt_samples/tree/jinja_whitespace_control) | How Jinja whitespace control breaks compiled SQL. It covers a stray comma that only appears in CI (inside a `{% for %}` loop with an `{% if %}`), tokens glued together by too much `-` stripping, and a `--` comment that silently swallows a column. Each broken model has a fixed version. |
 
 ## Using an example
 
