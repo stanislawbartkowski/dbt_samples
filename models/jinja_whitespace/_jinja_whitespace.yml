@@ -1,0 +1,19 @@
+version: 2
+
+models:
+  - name: ci_trailing_comma
+    description: "BROKEN in CI: trailing comma before FROM when last_name is skipped on --target ci."
+    config:
+      tags: ["broken"]
+  - name: glued_tokens
+    description: "BROKEN: over-stripped whitespace glues SQL tokens together (selectcustomer_id ...)."
+    config:
+      tags: ["broken"]
+  - name: comment_eats_sql
+    description: "BROKEN (silently): builds, but last_name is swallowed by a -- comment."
+  - name: ci_trailing_comma_fixed
+    description: "Fixed version of ci_trailing_comma."
+  - name: comment_eats_sql_fixed
+    description: "Fixed version of comment_eats_sql."
+  - name: glued_tokens_fixed
+    description: "Fixed version of glued_tokens."

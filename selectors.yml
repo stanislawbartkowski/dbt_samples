@@ -1,0 +1,11 @@
+selectors:
+  - name: default
+    description: "Everything except the intentionally broken whitespace demos."
+    default: true
+    definition:
+      union:
+        - method: fqn
+          value: "*"
+        - exclude:
+            - method: tag
+              value: broken

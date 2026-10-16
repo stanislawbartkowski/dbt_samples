@@ -1,6 +1,150 @@
-# dbt_utils_demo
+# dbt_utils_demo: Jinja whitespace control
 
-A small dbt v2 project for Postgres. It loads a `customers` seed and builds a `customer_full_names` view with dbt's `concat` macro. The project overrides `concat` to join fields with `' - '`. The `dbt_utils` package is installed as a dependency.
+This branch shows how Jinja whitespace control, or the lack of it, breaks the SQL that dbt compiles. The examples are in `models/jinja_whitespace/`. Each broken model has a `_fixed` version next to it.
+
+This branch builds on [`concat_macro_overrides`](https://github.com/stanislawbartkowski/dbt_samples/tree/concat_macro_overrides). Setup is identical, so see [Setup](#setup) below.
+
+## The problem
+
+> "A model compiles fine locally, but in CI it produces SQL with a stray comma. It only happens inside a `{% for %}` loop with an `{% if %}` inside it. The Jinja logic is correct."
+
+By default, every `{% ... %}` tag leaves its line break and indentation in the output, and dbt doesn't strip them. The `-` modifier strips whitespace on one side of a tag: `{%- ... %}` strips before the tag and `{% ... -%}` strips after it. Too little stripping buries problems under blank lines. Too much glues tokens together or pulls code into a `--` comment. Code review often misses these bugs, because the diff looks harmless while the compiled SQL is wrong.
+
+## The examples
+
+| Model | Fails on | What goes wrong |
+| --- | --- | --- |
+| `ci_trailing_comma` | `--target ci` only | Stray comma before `FROM` |
+| `glued_tokens` | every target | `selectcustomer_id,...` (database syntax error) |
+| `comment_eats_sql` | nothing (silent) | Builds, but `last_name` is missing |
+
+The first two are tagged `broken`. The default selector in `selectors.yml` excludes that tag, so a plain `dbt build` still passes. Run a broken model explicitly to see it fail.
+
+All commands below assume this setup:
+
+```bash
+source .venv/bin/activate
+set -a; source env_standard; set +a
+export DBT_PROFILES_DIR=.
+```
+
+### 1. Stray comma only in CI: `ci_trailing_comma`
+
+```sql
+select
+{% for col in columns %}
+    {% if not (target.name == 'ci' and col == 'last_name') %}
+    {{ col }}{% if not loop.last %},{% endif %}
+    {% endif %}
+{% endfor %}
+from {{ ref('customers') }}
+```
+
+`profiles.yml` has a second target, `ci`, that hides the PII column `last_name`. On `dev`, the loop outputs every column. On `ci`, it skips the last one, but `loop.last` still refers to the full list, so `first_name` keeps its comma:
+
+```bash
+dbt compile -s ci_trailing_comma              # dev: fine
+dbt compile -s ci_trailing_comma --target ci  # ci: see the output below
+dbt run     -s ci_trailing_comma --target ci  # syntax error at or near "from"
+```
+
+```sql
+select
+
+    
+    
+    customer_id,
+    
+
+    
+    
+    first_name,
+    
+
+    
+    
+
+from "dbt_edu"."dbt_utils_demo_ci"."customers"
+```
+
+**Why "only in CI"?** Whitespace handling is deterministic, so the environment doesn't change how it behaves. CI runs with different inputs (here, `target.name`), which takes a different branch of the `if`. Without whitespace control, every tag leaves a blank line, so the dangling comma is buried in empty space and hard to spot.
+
+**Fix** (`ci_trailing_comma_fixed`): filter the list *before* the loop, so `loop.last` refers to the last column actually output. Add `-` only on the loop tags:
+
+```sql
+{%- if target.name == 'ci' -%}
+    {%- set columns = columns | reject('equalto', 'last_name') | list -%}
+{%- endif %}
+
+select
+{%- for col in columns %}
+    {{ col }}{{ "," if not loop.last }}
+{%- endfor %}
+from {{ ref('customers') }}
+```
+
+```sql
+select
+    customer_id,
+    first_name
+from "dbt_edu"."dbt_utils_demo_ci"."customers"
+```
+
+### 2. Too much stripping: `glued_tokens`
+
+Adding `-` on both sides of every tag also removes the spaces SQL needs between words:
+
+```sql
+select
+    {%- for col in columns -%}
+    {{ col }}{{ "," if not loop.last }}
+    {%- endfor -%}
+from {{ ref('customers') }}
+```
+
+```sql
+selectcustomer_id,first_name,last_namefrom "dbt_edu"."dbt_utils_demo"."customers"
+```
+
+```bash
+dbt run -s glued_tokens   # syntax error at or near "selectcustomer_id"
+```
+
+**Fix** (`glued_tokens_fixed`): strip only *before* each tag (`{%- for %}`, `{%- endfor %}`). That keeps the line break after `select` and before `from`.
+
+### 3. A comment eats code: `comment_eats_sql`
+
+This is the most dangerous case, because nothing fails:
+
+```sql
+    first_name -- optional columns below
+    {%- if var('include_last_name', true) -%}
+    , last_name
+    {%- endif %}
+```
+
+The `-%}` strips the line break after the tag, and that line break was what ended the `--` comment. `, last_name` moves onto the comment line:
+
+```sql
+select
+    customer_id,
+    first_name -- optional columns below, last_name
+from "dbt_edu"."dbt_utils_demo"."customers"
+```
+
+```bash
+dbt show -s comment_eats_sql --limit 1   # columns: customer_id, first_name (no last_name)
+```
+
+**Fix** (`comment_eats_sql_fixed`): use `{%- if ... %}` without the trailing `-`, so the line break that ends the comment stays.
+
+## Takeaways
+
+- **Check the compiled SQL, not the Jinja.** Use `dbt compile -s <model>` or look in `target/compiled/`, and compile for every target you deploy to (`--target ci`).
+- **Add `-` only on the tag closest to the problem.** Adding it to every tag in a macro causes problem 2.
+- **Never let a `-%}` follow a `--` comment.** Use `/* ... */` comments in Jinja-heavy SQL.
+- **For trailing separators, filter first, then loop**, or build a list and use `| join(', ')`. Then commas never depend on `loop.last`.
+- **dbt compile won't catch these.** `dbt compile` succeeds for all three models. The errors only appear when Postgres runs the SQL, and problem 3 never errors at all.
 
 ## Project layout
 
@@ -12,7 +156,9 @@ A small dbt v2 project for Postgres. It loads a `customers` seed and builds a `c
 | `packages.yml` | dbt package dependencies (`dbt-labs/dbt_utils` 1.x) |
 | `pyproject.toml` / `uv.lock` | Python environment; pins `dbt==2.0.8` |
 | `env_standard` | Environment variables the project needs (see below) |
-| `profiles.yml` | Connection settings for a local Postgres (generic `dbt` / `secret` credentials) |
+| `profiles.yml` | Connection settings for a local Postgres (generic `dbt` / `secret` credentials). Targets: `dev` (default) and `ci` (schema `dbt_utils_demo_ci`) |
+| `models/jinja_whitespace/` | Whitespace-control demos: broken models and their `_fixed` versions |
+| `selectors.yml` | Default selector that excludes models tagged `broken` |
 
 ## Prerequisites
 
