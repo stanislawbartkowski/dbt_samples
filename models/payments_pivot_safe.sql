@@ -1,5 +1,6 @@
 {#- FIXED: read the result only when execute is True. The only change from
-    payments_pivot_naive is the {% if execute %} block. -#}
+    payments_pivot_naive is the {% if execute %} block
+    around reading and checking the result. -#}
 {% set payment_method_query %}
 select distinct payment_method from {{ ref('payments') }} order by 1
 {% endset %}
@@ -8,6 +9,9 @@ select distinct payment_method from {{ ref('payments') }} order by 1
 {{ log("payments_pivot_safe: execute=" ~ execute, info=true) }}
 {% if execute %}
   {% set payment_methods = results.columns[0].values() %}
+  {% if payment_methods | length == 0 %}
+    {{ exceptions.raise_compiler_error("payments has no payment methods") }}
+  {% endif %}
 {% else %}
   {% set payment_methods = [] %}
 {% endif %}

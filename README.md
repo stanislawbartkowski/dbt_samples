@@ -1,39 +1,67 @@
 # dbt_utils_demo: `run_query()` during parse
 
-This branch shows what `run_query()` returns while dbt parses the project, why reading its result without an `{% if execute %}` guard fails with `'None' has no attribute 'table'` in dbt-core 1.x, and why the same code doesn't fail in dbt v2.
+This branch shows what `run_query()` returns while dbt parses the project, and why reading its result without an `{% if execute %}` guard breaks `dbt parse`. In dbt 2.0.8 the same model still passes `dbt run`, so the bug can stay hidden until CI runs `dbt parse`.
 
 This branch uses the same dbt v2, Postgres and uv setup as [`concat_macro_overrides`](https://github.com/stanislawbartkowski/dbt_samples/tree/concat_macro_overrides), without the `concat` override. dbt-core 1.x runs through `uvx`; nothing extra is installed in the project. See [Setup](#setup) below.
 
 ## The problem
 
-> "My model calls `run_query()`, and on a fresh CI checkout with `--no-partial-parse` the first parse fails with `'None' has no attribute 'table'`."
+> "My model calls `run_query()` and works fine in `dbt run`. In CI, `dbt parse --no-partial-parse` fails on it."
 
 dbt works in two phases:
 
 1. **Parse.** dbt reads every file and renders its Jinja once to collect `ref()`, `source()` and `config()` and build the DAG. No SQL runs against the warehouse. `execute` is `False`.
 2. **Execution.** dbt renders the selected nodes again and runs their SQL. `execute` is `True`.
 
-During parse, `run_query()` doesn't run the query. In dbt-core 1.x it returns `None`, so any code that reads the result, such as `results.columns[0].values()`, fails. The `run_query()` call itself is safe at parse time; reading its result is not.
+During parse, `run_query()` doesn't run the query. The `run_query()` call itself is safe at parse time; reading its result is not:
+
+- **dbt-core 1.x** returns `None`, so `results.columns[0].values()` fails with `'None' has no attribute 'table'`.
+- **dbt 2.0.8** returns an empty undefined value. Reading `.columns[0].values()` from it gives an empty list without an error, but any code that expects real data fails. Here, that's a check that the list isn't empty.
 
 ## The example
 
-`seeds/payments.csv` holds 5 payments with 4 payment methods. Two models pivot the amounts into one column per payment method. They read the list of methods with `run_query()`. The models are identical except for the guard around reading the result:
+`seeds/payments.csv` holds 5 payments with 4 payment methods. Two models pivot the amounts into one column per payment method. They read the list of methods with `run_query()` and stop with an error if it is empty. The models are identical except for the `{% if execute %}` guard around reading and checking the result:
 
 ```sql
 {# BROKEN: models/payments_pivot_naive.sql #}
 {% set results = run_query(payment_method_query) %}
 {% set payment_methods = results.columns[0].values() %}
+{% if payment_methods | length == 0 %}
+  {{ exceptions.raise_compiler_error("payments has no payment methods") }}
+{% endif %}
 
 {# FIXED: models/payments_pivot_safe.sql #}
 {% set results = run_query(payment_method_query) %}
 {% if execute %}
   {% set payment_methods = results.columns[0].values() %}
+  {% if payment_methods | length == 0 %}
+    {{ exceptions.raise_compiler_error("payments has no payment methods") }}
+  {% endif %}
 {% else %}
   {% set payment_methods = [] %}
 {% endif %}
 ```
 
-During parse, the safe model renders with an empty list. The SQL it produces is invalid (`customer_id,` followed by `from`), but parse never runs it. During execution, the list holds the real payment methods.
+During parse, the safe model renders with an empty list and skips the check. The SQL it produces is invalid (`customer_id,` followed by `from`), but parse never runs it. During execution, the list holds the real payment methods.
+
+### Reproduce it with dbt 2.0.8
+
+```bash
+source .venv/bin/activate
+set -a; source env_standard; set +a
+export DBT_PROFILES_DIR=.
+
+dbt seed
+dbt run                        # succeeds, including payments_pivot_naive
+dbt parse --no-partial-parse   # fails
+```
+
+Output of `dbt parse`:
+
+```
+[error] [JinjaError (dbt1501)]: Failed to render SQL invalid operation: Compilation Error for dbt_utils_demo.payments_pivot_naive from models/payments_pivot_naive.sql: payments has no payment methods
+  --> models/payments_pivot_naive.sql:11:3
+```
 
 ### Reproduce it with dbt-core 1.x
 
@@ -53,33 +81,23 @@ Compilation Error in model payments_pivot_naive (models/payments_pivot_naive.sql
 
 `--target-path target_core` keeps the dbt-core manifest apart from the dbt v2 one in `target/`.
 
-### The same code in dbt v2
+### What each command does with `payments_pivot_naive`
 
-```bash
-source .venv/bin/activate
-set -a; source env_standard; set +a
-
-dbt parse --no-partial-parse   # succeeds
-dbt seed
-dbt show -s payments_pivot_naive
-```
-
-In dbt 2.0.8, `run_query()` during parse returns an empty undefined value instead of `None`. Reading `.columns[0].values()` from it gives an empty result instead of an error, so both models parse and run. The guard is still worth writing: it makes the parse-time branch explicit, and the model keeps working with dbt-core 1.x.
-
-### What each version does
-
-| | dbt-core 1.11.16 | dbt 2.0.8 |
+| Command | dbt-core 1.11.16 | dbt 2.0.8 |
 | --- | --- | --- |
-| `run_query()` during parse | `None` | empty undefined value |
-| `payments_pivot_naive` | **parse fails** | parses, runs |
-| `payments_pivot_safe` | parses, runs | parses, runs |
-| `dbt run -s payments_pivot_safe` | **fails**: the naive model is still parsed | succeeds |
+| `dbt parse`, `dbt ls` | **fails** | **fails** |
+| `dbt run`, `dbt build`, `dbt compile`, `dbt docs generate` | **fails** | succeeds |
+| `dbt run -s payments_pivot_safe` | **fails** | succeeds |
 
-In dbt-core, `--select` and `--exclude` don't help. Every command parses every model, so one broken model blocks `dbt run`, `dbt build` and `dbt compile` for the whole project.
+All results are with `--no-partial-parse`. `payments_pivot_safe` succeeds in every command in both versions.
+
+In dbt 2.0.8, the commands that connect to the database still render each model during parse, but they don't report a parse-time error in a model that renders correctly during execution. `dbt parse` and `dbt ls` never connect, so they report it. A developer who only runs `dbt run` locally never sees the error; a CI step that runs `dbt parse` does.
+
+In dbt-core, `--select` and `--exclude` don't help. Every command parses every model, so one broken model blocks every command for the whole project.
 
 ## Does partial parsing hide the bug?
 
-A common explanation for "it worked on my machine": dbt-core's partial parsing cache (`target/partial_parse.msgpack`) skips files that haven't changed, so the broken code path never renders locally. With dbt-core 1.11.16, the bug showed up on every parse that touched the code:
+A common explanation for "it worked on my machine": the partial parsing cache (`target/partial_parse.msgpack`) skips files that haven't changed, so the broken code path never renders locally. With dbt-core 1.11.16, the bug showed up on every parse that touched the code:
 
 | Step | Result |
 | --- | --- |
@@ -87,7 +105,7 @@ A common explanation for "it worked on my machine": dbt-core's partial parsing c
 | Remove the guard from a macro that a model calls, then `dbt parse` (partial) | **fails**: dbt re-parses every model that calls the changed macro |
 | `dbt run` after either change | **fails** |
 
-Partial parsing only skips files that already parsed successfully and haven't changed since. A file with this bug can't parse successfully in dbt-core, so the cache can't hold a good version of it. If the bug shows up only in CI, compare the dbt version and the files CI parses before blaming the cache.
+Partial parsing only skips files that already parsed successfully and haven't changed since. A file with this bug can't parse successfully in dbt-core, so the cache can't hold a good version of it. In dbt 2.0.8, `dbt parse` fails with or without partial parsing, and `dbt run` succeeds either way. If the bug shows up only in CI, compare the dbt version and the commands CI runs before blaming the cache.
 
 ## Notes
 
@@ -122,7 +140,7 @@ Partial parsing only skips files that already parsed successfully and haven't ch
 | `seeds/customers.csv` | Sample customer data loaded with `dbt seed` |
 | `models/customer_full_names.sql` | View that combines first and last name into `full_name` |
 | `seeds/payments.csv` | Payments with a `payment_method` column |
-| `models/payments_pivot_naive.sql` | Pivot that reads `run_query()` results without a guard (broken in dbt-core) |
+| `models/payments_pivot_naive.sql` | Pivot that reads and checks `run_query()` results without a guard (fails `dbt parse`) |
 | `models/payments_pivot_safe.sql` | Same pivot with the `{% if execute %}` guard |
 | `packages.yml` | dbt package dependencies (`dbt-labs/dbt_utils` 1.x) |
 | `pyproject.toml` / `uv.lock` | Python environment; pins `dbt==2.0.8` |
