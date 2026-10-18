@@ -1,0 +1,6 @@
+payment_id,customer_id,payment_method,amount
+1,1,credit_card,10
+2,1,bank_transfer,20
+3,2,credit_card,15
+4,3,gift_card,5
+5,3,coupon,7

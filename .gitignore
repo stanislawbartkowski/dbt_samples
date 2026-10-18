@@ -5,3 +5,4 @@ logs/
 package-lock.yml
 dbt_internal_packages/
 .user.yml
+target_core/
