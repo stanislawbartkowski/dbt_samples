@@ -1,12 +1,11 @@
 dbt_utils_demo:
   outputs:
     dev:
-      type: postgres
-      host: localhost
-      port: 5432
-      user: dbt
-      password: secret
-      dbname: dbt_edu
-      schema: dbt_utils_demo
+      type: spark
+      method: spark-connect
+      # dbt 2.0.8 builds the URL as sc://<host>:<port>/, and the Spark Connect
+      # client rejects the trailing "/". Put the port and a user in host instead.
+      host: "localhost:15002/;user_id=dbt"
+      schema: dbt_fetch_result
       threads: 1
   target: dev
