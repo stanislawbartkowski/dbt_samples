@@ -1,6 +1,6 @@
 # dbt_utils_demo: `run_query()` vs `statement()` for Delta `OPTIMIZE`
 
-This branch shows why swapping `statement(..., fetch_result=False)` for `run_query()` in an `OPTIMIZE ... ZORDER BY` post-hook crashes dbt 2.0.8 on Spark with Delta Lake, while dbt-core 1.x runs the same code without complaint.
+This branch shows why swapping `statement(..., fetch_result=False)` for `run_query()` in an `OPTIMIZE ... ZORDER BY` post-hook crashes dbt 2.0.9 on Spark with Delta Lake, while dbt-core 1.x runs the same code without complaint.
 
 This branch uses the same dbt v2 and uv setup as [`concat_macro_overrides`](https://github.com/stanislawbartkowski/dbt_samples/tree/concat_macro_overrides), but on Spark (through Spark Connect) instead of Postgres, and without the `concat` override. dbt-core 1.x runs through `uvx`; nothing extra is installed in the project. See [Setup](#setup) below.
 
@@ -13,7 +13,7 @@ This branch uses the same dbt v2 and uv setup as [`concat_macro_overrides`](http
 - **`run_query()`** always fetches the result set and turns it into a table you can read in Jinja.
 - **`statement(..., fetch_result=False)`** runs the SQL and ignores the result.
 
-Delta's `OPTIMIZE` returns one row of metrics. Spark declares some nested metric columns as non-nullable, but returns nulls in them, for example `metrics.clusteringStats.inputZCubeFiles.numFiles`. When dbt 2.0.8 converts that row, it checks nullability and stops:
+Delta's `OPTIMIZE` returns one row of metrics. Spark declares some nested metric columns as non-nullable, but returns nulls in them, for example `metrics.clusteringStats.inputZCubeFiles.numFiles`. When dbt 2.0.9 converts that row, it checks nullability and stops:
 
 ```
 panic: panicked at fs/sa/crates/dbt-agate/src/flat_record_batch.rs:44:26:
@@ -52,7 +52,7 @@ Each model calls one of them:
 select * from {{ ref('customers') }}
 ```
 
-### Reproduce it with dbt 2.0.8
+### Reproduce it with dbt 2.0.9
 
 ```bash
 source .venv/bin/activate
@@ -82,12 +82,12 @@ $CORE run -s customers_optimized_naive --target-path target_core   # succeeds
 
 ### What each command does with `customers_optimized_naive`
 
-| Command | dbt-core 1.11.16 | dbt 2.0.8 |
+| Command | dbt-core 1.11.16 | dbt 2.0.9 |
 | --- | --- | --- |
 | `dbt run`, `dbt build` | succeeds | **panics** |
 | `dbt compile`, `dbt show`, `dbt docs generate` | – | succeeds |
 
-`customers_optimized_safe` succeeds in every command in both versions. Tested with Spark 4.2.0, Delta Lake 4.4.1 and dbt-spark 1.11.0.
+`customers_optimized_safe` succeeds in every command in both versions. Tested with Spark 4.2.0, Delta Lake 4.4.1 and dbt-spark 1.11.0. dbt 2.0.8 behaves the same as 2.0.9.
 
 The panic is worse than a failed model:
 
@@ -97,7 +97,7 @@ The panic is worse than a failed model:
 ## Notes
 
 - **`ZORDER` isn't the trigger.** `OPTIMIZE` without `ZORDER BY` panics too, on a different column (`metrics/zOrderStats/inputCubeFiles/num`). Any `run_query()` whose result has this mismatch fails the same way.
-- **A plain-SQL hook also works.** dbt doesn't type-check what hook SQL returns, so this runs in dbt 2.0.8:
+- **A plain-SQL hook also works.** dbt doesn't type-check what hook SQL returns, so this runs in dbt 2.0.9:
 
   ```sql
   {{ config(post_hook="optimize {{ this }} zorder by (customer_id)") }}
@@ -105,7 +105,7 @@ The panic is worse than a failed model:
 
   Use a macro with `statement()` when the hook needs logic, such as an optional `ZORDER BY`.
 - **Rule of thumb:** use `run_query()` only when you read the result in Jinja. For maintenance and DDL whose result you ignore (`OPTIMIZE`, `VACUUM`, grants, drops), use `statement(..., fetch_result=False)` or plain hook SQL.
-- **Not every command is affected.** In this setup, `VACUUM`, `DESCRIBE HISTORY`, `DESCRIBE DETAIL` and about 20 plain Spark commands (`ANALYZE`, `DESCRIBE`, `SHOW ...`, `CACHE`) returned results that dbt 2.0.8 read without errors.
+- **Not every command is affected.** In this setup, `VACUUM`, `DESCRIBE HISTORY`, `DESCRIBE DETAIL` and about 20 plain Spark commands (`ANALYZE`, `DESCRIBE`, `SHOW ...`, `CACHE`) returned results that dbt 2.0.9 read without errors.
 
 ## Project layout
 
@@ -114,10 +114,10 @@ The panic is worse than a failed model:
 | `seeds/customers.csv` | Sample customer data loaded with `dbt seed` |
 | `models/customer_full_names.sql` | View that combines first and last name into `full_name` |
 | `macros/run_optimize.sql` | `optimize_sql`, `run_optimize_naive` (`run_query`) and `run_optimize_safe` (`statement`) |
-| `models/customers_optimized_naive.sql` | Delta table with the `run_query()` post-hook (panics in dbt 2.0.8) |
+| `models/customers_optimized_naive.sql` | Delta table with the `run_query()` post-hook (panics in dbt 2.0.9) |
 | `models/customers_optimized_safe.sql` | Same table with the `statement()` post-hook |
 | `packages.yml` | dbt package dependencies (`dbt-labs/dbt_utils` 1.x) |
-| `pyproject.toml` / `uv.lock` | Python environment; pins `dbt==2.0.8` |
+| `pyproject.toml` / `uv.lock` | Python environment; pins `dbt==2.0.9` |
 | `env_standard` | Environment variables the project needs (see below) |
 | `profiles.yml` | dbt v2 connection to Spark Connect on `localhost:15002`, schema `dbt_fetch_result` |
 | `profiles_core/profiles.yml` | dbt-core 1.x connection through PySpark, schema `dbt_fetch_result_core` |
@@ -142,7 +142,7 @@ The panic is worse than a failed model:
 
    ```bash
    uv sync
-   uv run dbt --version   # dbt 2.0.8
+   uv run dbt --version   # dbt 2.0.9
    ```
 
 2. **Check `profiles.yml`.** It is included and points to Spark Connect on `localhost:15002`:
@@ -159,7 +159,7 @@ The panic is worse than a failed model:
      target: dev
    ```
 
-   dbt 2.0.8 builds the URL as `sc://<host>:<port>/`, and the Spark Connect client rejects the trailing `/`. Put the port and a user in `host`, as above, and leave out `port`.
+   dbt 2.0.9 builds the URL as `sc://<host>:<port>/`, and the Spark Connect client rejects the trailing `/`. Put the port and a user in `host`, as above, and leave out `port`.
 
 3. **Install dbt packages:**
 

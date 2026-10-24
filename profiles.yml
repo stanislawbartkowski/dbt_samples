@@ -3,7 +3,7 @@ dbt_utils_demo:
     dev:
       type: spark
       method: spark-connect
-      # dbt 2.0.8 builds the URL as sc://<host>:<port>/, and the Spark Connect
+      # dbt 2.0.9 builds the URL as sc://<host>:<port>/, and the Spark Connect
       # client rejects the trailing "/". Put the port and a user in host instead.
       host: "localhost:15002/;user_id=dbt"
       schema: dbt_fetch_result

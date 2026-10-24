@@ -4,12 +4,12 @@ requires-python = ">=3.14"
 
 [[package]]
 name = "dbt"
-version = "2.0.8"
+version = "2.0.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "mashumaro", extra = ["msgpack"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3e/e6/da179c17bd42ead7d70215f83ad2efafd8d525fc4e0e502c824e25ae52bb/dbt-2.0.8.tar.gz", hash = "sha256:b6c002bc792df98c0408785e3b4b25f51ffce9849651c54505cc95bc511b1bb9", size = 3286, upload-time = "2026-10-09T16:27:23.571Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/11/27/48a6a7fda183c55d82ac0ab393b21dc742f6ef3e17b2c2fd233fd20c0c4d/dbt-2.0.9.tar.gz", hash = "sha256:791946056d520147925c2057a1935975d82b555cd0a4d7e729b31a647f868d45", size = 3296, upload-time = "2026-10-19T22:40:22.851Z" }
 
 [[package]]
 name = "dbt-utils-demo"
@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "dbt", specifier = "==2.0.8" }]
+requires-dist = [{ name = "dbt", specifier = "==2.0.9" }]
 
 [[package]]
 name = "mashumaro"
