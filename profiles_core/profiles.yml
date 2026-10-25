@@ -1,0 +1,12 @@
+dbt_utils_demo:
+  outputs:
+    dev:
+      type: postgres
+      host: localhost
+      port: 5432
+      user: dbt
+      password: secret
+      dbname: dbt_edu
+      schema: dbt_macro_guards_core
+      threads: 1
+  target: dev

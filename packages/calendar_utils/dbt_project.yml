@@ -1,0 +1,8 @@
+name: 'calendar_utils'
+version: '0.1.0'
+config-version: 2
+
+# Coarse guard: dbt-core refuses to run outside this range. dbt 2.0.9 ignores it.
+require-dbt-version: [">=1.6.0", "<3.0.0"]
+
+macro-paths: ["macros"]
