@@ -41,7 +41,30 @@ alter view {{ relation }} set tblproperties ('customer_ids' = '{{ found_ids | jo
 
 `namespace()` is Jinja's official fix. It works for any value, including counters, strings and flags (`{% set ns.total = ns.total + 1 %}`). `append` works because it changes the list object, not the name, but only for lists and dicts.
 
-Each macro is the post-hook of one model, and each model is `select * from {{ ref('customers') }}`:
+Each macro is the post-hook of one model. The hook is set in the `config()` block on the first line of the model file:
+
+```sql
+-- models/customers_commented_naive.sql
+{{ config(post_hook="{{ comment_with_ids_naive(this) }}") }}
+
+select * from {{ ref('customers') }}
+```
+
+```sql
+-- models/customers_commented.sql
+{{ config(post_hook="{{ comment_with_ids(this) }}") }}
+
+select * from {{ ref('customers') }}
+```
+
+```sql
+-- models/customers_commented_append.sql
+{{ config(post_hook="{{ comment_with_ids_append(this) }}") }}
+
+select * from {{ ref('customers') }}
+```
+
+After dbt creates the view, it renders the macro and runs the `alter view` statement the macro returns. `this` is the view the model just created.
 
 | Model | Post-hook | `customer_ids` property |
 | --- | --- | --- |
