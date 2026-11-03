@@ -2,7 +2,7 @@
 
 This branch shows why a list built with `{% set %}` inside a `{% for %}` loop is empty after the loop, and two ways to fix it: `namespace()` and `{% do list.append() %}`.
 
-This branch uses the same dbt v2, Postgres and uv setup as [`concat_macro_overrides`](https://github.com/stanislawbartkowski/dbt_samples/tree/concat_macro_overrides), without the `concat` override. dbt-core 1.x runs through `uvx`; nothing extra is installed in the project. See [Setup](#setup) below.
+This branch uses the same dbt v2 and uv setup as [`concat_macro_overrides`](https://github.com/stanislawbartkowski/dbt_samples/tree/concat_macro_overrides), but on Spark (through Spark Connect) instead of Postgres, and without the `concat` override. dbt-core 1.x runs through `uvx`; nothing extra is installed in the project. See [Setup](#setup) below.
 
 ## The problem
 
@@ -14,7 +14,7 @@ This is standard Jinja scoping, not a dbt bug, and a global variable won't fix i
 
 ## The example
 
-`macros/comment_with_ids.sql` has three post-hook macros. Each one reads the `customer_id`s from the view it runs on and stores them in a comment on the view. They differ only in how they build the list:
+`macros/comment_with_ids.sql` has three post-hook macros. Each one reads the `customer_id`s from the view it runs on and stores them in the view's `customer_ids` table property. They differ only in how they build the list:
 
 ```sql
 {# BROKEN: the set inside the loop binds a new found_ids that disappears at endfor #}
@@ -22,36 +22,36 @@ This is standard Jinja scoping, not a dbt bug, and a global variable won't fix i
 {% for row in results %}
   {% set found_ids = found_ids + [row['customer_id']] %}
 {% endfor %}
-comment on view {{ relation }} is 'customer_ids: {{ found_ids | join(", ") }}'
+alter view {{ relation }} set tblproperties ('customer_ids' = '{{ found_ids | join(", ") }}')
 
 {# FIXED: a namespace attribute set inside the loop is still visible after it #}
 {% set ns = namespace(found_ids=[]) %}
 {% for row in results %}
   {% set ns.found_ids = ns.found_ids + [row['customer_id']] %}
 {% endfor %}
-comment on view {{ relation }} is 'customer_ids: {{ ns.found_ids | join(", ") }}'
+alter view {{ relation }} set tblproperties ('customer_ids' = '{{ ns.found_ids | join(", ") }}')
 
 {# ALSO FIXED: append mutates the list in place instead of rebinding the name #}
 {% set found_ids = [] %}
 {% for row in results %}
   {% do found_ids.append(row['customer_id']) %}
 {% endfor %}
-comment on view {{ relation }} is 'customer_ids: {{ found_ids | join(", ") }}'
+alter view {{ relation }} set tblproperties ('customer_ids' = '{{ found_ids | join(", ") }}')
 ```
 
 `namespace()` is Jinja's official fix. It works for any value, including counters, strings and flags (`{% set ns.total = ns.total + 1 %}`). `append` works because it changes the list object, not the name, but only for lists and dicts.
 
 Each macro is the post-hook of one model, and each model is `select * from {{ ref('customers') }}`:
 
-| Model | Post-hook | Comment on the view |
+| Model | Post-hook | `customer_ids` property |
 | --- | --- | --- |
-| `customers_commented_naive` | `comment_with_ids_naive` | **`customer_ids: `** (empty) |
-| `customers_commented` | `comment_with_ids` (`namespace`) | `customer_ids: 1, 2, 3, 4` |
-| `customers_commented_append` | `comment_with_ids_append` | `customer_ids: 1, 2, 3, 4` |
+| `customers_commented_naive` | `comment_with_ids_naive` | **empty** |
+| `customers_commented` | `comment_with_ids` (`namespace`) | `1, 2, 3, 4` |
+| `customers_commented_append` | `comment_with_ids_append` | `1, 2, 3, 4` |
 
-The results are the same on dbt 2.0.9 and dbt-core 1.11.16.
+The results are the same on dbt 2.0.9 and dbt-core 1.11.16 with dbt-spark 1.11.0, tested on Spark 4.2.0.
 
-**Nothing fails.** `dbt build` succeeds for all three models. The broken hook still produces valid SQL, just with an empty list. You only notice when you read the hook's SQL or the comment itself. This pattern is common in dbt macros, which often loop over `graph.nodes.values()`, query results or column lists to build SQL.
+**Nothing fails.** `dbt build` succeeds for all three models. The broken hook still produces valid SQL, just with an empty list. You only notice when you read the hook's SQL or the property itself. This pattern is common in dbt macros, which often loop over `graph.nodes.values()`, query results or column lists to build SQL.
 
 **What to look for in code review:** a `{% set %}` inside a `{% for %}` loop that assigns a variable which is read after the loop. If you find one, use `namespace()`.
 
@@ -64,42 +64,45 @@ export DBT_PROFILES_DIR=.
 
 dbt build    # all models succeed, including customers_commented_naive
 
-dbt show --inline "select c.relname as view_name, obj_description(c.oid) as comment
-  from pg_class c join pg_namespace n on n.oid = c.relnamespace
-  where n.nspname = '{{ target.schema }}' and c.relname like 'customers_commented%' order by 1"
+for m in customers_commented customers_commented_append customers_commented_naive; do
+  dbt show --limit -1 --inline "show tblproperties {{ target.schema }}.$m ('customer_ids')"
+done
 ```
 
+The two fixed views show `1, 2, 3, 4`. The naive one shows an empty value:
+
 ```
-│ view_name                  ┆ comment                  │
-│ customers_commented        ┆ customer_ids: 1, 2, 3, 4 │
-│ customers_commented_append ┆ customer_ids: 1, 2, 3, 4 │
-│ customers_commented_naive  ┆ customer_ids:            │
+│ key          ┆ value │
+│ customer_ids ┆       │
 ```
+
+`--limit -1` matters: by default `dbt show` adds `limit 10` to the query, and Spark rejects a `limit` after `show tblproperties`.
 
 To see the SQL the hook ran, look in `logs/query_log.sql`, or run the model with `--log-level debug`:
 
 ```bash
-dbt run -s customers_commented_naive --log-level debug | grep "comment on"
-# comment on view "dbt_edu"."dbt_jinja_scoping"."customers_commented_naive" is 'customer_ids: '
+dbt run -s customers_commented_naive --log-level debug | grep "alter view"
+# alter view `dbt_jinja_scoping`.`customers_commented_naive` set tblproperties ('customer_ids' = '')
 ```
 
 ### Reproduce it with dbt-core 1.x
 
-`profiles_core/profiles.yml` uses the same Postgres with the schema `dbt_jinja_scoping_core`:
+dbt-spark has no Spark Connect method. Its `session` method uses PySpark, which connects to Spark Connect when `SPARK_REMOTE` is set. `profiles_core/profiles.yml` uses that, with the schema `dbt_jinja_scoping_core`:
 
 ```bash
+export SPARK_REMOTE=sc://localhost:15002
 export DBT_PROFILES_DIR=profiles_core
-CORE="uvx --python 3.11 --from dbt-core~=1.11.0 --with dbt-postgres~=1.11.0 dbt"
+CORE="uvx --python 3.12 --from dbt-core~=1.11.0 --with dbt-spark[session]~=1.10 --with pyspark[connect]==4.2.0 dbt"
 
 $CORE build --target-path target_core
-grep "comment on view" logs/dbt.log
+grep "alter view" logs/dbt.log
 ```
 
 `--target-path target_core` keeps the dbt-core manifest apart from the dbt v2 one in `target/`.
 
 ## Notes
 
-- **Why `if execute`?** dbt renders the hooks while parsing too, when `run_query` returns nothing. The macros only run the query and output the `comment` statement when `execute` is true.
+- **Why `if execute`?** dbt renders the hooks while parsing too, when `run_query` returns nothing. The macros only run the query and output the `alter view` statement when `execute` is true.
 - **What a `log` inside the loop shows.** Each iteration starts again from the outer, empty `found_ids`, so `{{ log(found_ids, info=true) }}` inside the loop prints `[1]`, `[2]`, `[3]`, not a growing list. After `{% endfor %}` it prints `[]`.
 
 ## Project layout
@@ -115,12 +118,19 @@ grep "comment on view" logs/dbt.log
 | `packages.yml` | dbt package dependencies (`dbt-labs/dbt_utils` 1.x) |
 | `pyproject.toml` / `uv.lock` | Python environment; pins `dbt==2.0.9` |
 | `env_standard` | Environment variables the project needs (see below) |
-| `profiles.yml` | dbt v2 connection to a local Postgres (generic `dbt` / `secret` credentials), schema `dbt_jinja_scoping` |
-| `profiles_core/profiles.yml` | dbt-core 1.x connection, schema `dbt_jinja_scoping_core` |
+| `profiles.yml` | dbt v2 connection to Spark Connect on `localhost:15002`, schema `dbt_jinja_scoping` |
+| `profiles_core/profiles.yml` | dbt-core 1.x connection through PySpark, schema `dbt_jinja_scoping_core` |
 
 ## Prerequisites
 
-- A running Postgres instance (by default `localhost:5432`, database `dbt_edu`)
+- A Spark Connect server on `localhost:15002`. This branch was tested with Spark 4.2.0. The models are plain views and don't use Delta Lake. For example:
+
+  ```bash
+  $SPARK_HOME/sbin/start-connect-server.sh \
+    --packages org.apache.spark:spark-connect_2.13:4.2.0 \
+    --conf spark.sql.catalogImplementation=hive
+  ```
+
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
 
 ## Setup
@@ -132,22 +142,21 @@ grep "comment on view" logs/dbt.log
    uv run dbt --version   # dbt 2.0.9
    ```
 
-2. **Check `profiles.yml`.** It is included and points to a local Postgres with generic credentials. If your database is set up differently, change these settings:
+2. **Check `profiles.yml`.** It is included and points to Spark Connect on `localhost:15002`:
 
    ```yaml
    dbt_utils_demo:
-     target: dev
      outputs:
        dev:
-         type: postgres
-         host: localhost
-         port: 5432
-         user: dbt
-         password: secret   # dbt v2 requires `password`, not `pass`
-         dbname: dbt_edu
+         type: spark
+         method: spark-connect
+         host: "localhost:15002/;user_id=dbt"
          schema: dbt_jinja_scoping
          threads: 1
+     target: dev
    ```
+
+   dbt 2.0.9 builds the URL as `sc://<host>:<port>/`, and the Spark Connect client rejects the trailing `/`. Put the port and a user in `host`, as above, and leave out `port`.
 
 3. **Install dbt packages:**
 
@@ -163,7 +172,7 @@ grep "comment on view" logs/dbt.log
 DBT_ALLOW_EXPERIMENTAL_ADAPTERS=true
 ```
 
-dbt v2 treats Postgres as an experimental adapter and refuses to run without this flag. If it is missing, dbt fails with `The 'postgres' adapter is not yet supported`.
+dbt v2 treats Spark as an experimental adapter and refuses to run without this flag. If it is missing, dbt fails with `The 'spark' adapter is not yet supported`.
 
 Load it in one of two ways:
 
@@ -200,7 +209,8 @@ To skip passing `--profiles-dir .` each time, run `export DBT_PROFILES_DIR=.`.
 
 | Error | Fix |
 | --- | --- |
-| `The 'postgres' adapter is not yet supported` | `env_standard` isn't loaded; see [Environment variables](#environment-variables) |
-| `missing field 'password'` | Rename `pass:` to `password:` in `profiles.yml` |
-| Comment is `customer_ids: ` with no ids | A `{% set %}` inside a `for` loop rebinds the list; use `namespace()` or `{% do list.append() %}` |
+| `The 'spark' adapter is not yet supported` | `env_standard` isn't loaded; see [Environment variables](#environment-variables) |
+| `the URL path (/) must be empty or have a proper parameter syntax` | Put the port in `host` (`"localhost:15002/;user_id=dbt"`) and remove `port`; see [Setup](#setup) |
+| `Syntax error at or near 'limit'` from `dbt show` | Add `--limit -1` when the query is a `show ...` statement |
+| The `customer_ids` property is empty | A `{% set %}` inside a `for` loop rebinds the list; use `namespace()` or `{% do list.append() %}` |
 | `Could not find profile named 'dbt_utils_demo'` | Pass `--profiles-dir .` or set `DBT_PROFILES_DIR` |
