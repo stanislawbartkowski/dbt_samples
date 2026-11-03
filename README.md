@@ -98,7 +98,21 @@ dbt build    # all models succeed, including customers_commented_naive
 
 `customer_ids` is not a column. It is metadata stored on the view in the Spark catalog, so `select * from customers_commented` and `dbt show --select customers_commented` don't show it. Use Spark's metadata commands instead.
 
-List the view's properties:
+Compare the broken and the fixed view. The model names differ only by the `_naive` suffix, so check which one you query.
+
+**Broken:** `customers_commented_naive` has an empty `customer_ids`:
+
+```bash
+dbt show --limit -1 --inline "show tblproperties {{ target.schema }}.customers_commented_naive"
+```
+
+```
+│ key                   ┆ value      │
+│ customer_ids          ┆            │
+│ transient_lastDdlTime ┆ 1793703805 │
+```
+
+**Fixed:** `customers_commented` has all four ids:
 
 ```bash
 dbt show --limit -1 --inline "show tblproperties {{ target.schema }}.customers_commented"
@@ -110,21 +124,23 @@ dbt show --limit -1 --inline "show tblproperties {{ target.schema }}.customers_c
 │ transient_lastDdlTime ┆ 1793703269 │
 ```
 
-Or read it with the rest of the view's metadata, in the `Table Properties` row:
+`describe table extended` shows the properties in its `Table Properties` row. It leaves out properties with an empty value, so on the naive view `customer_ids` doesn't appear at all:
 
 ```bash
+dbt show --limit -1 --inline "describe table extended {{ target.schema }}.customers_commented_naive"
 dbt show --limit -1 --inline "describe table extended {{ target.schema }}.customers_commented"
 ```
 
 ```
-│ View Text        ┆ select * from `dbt_jinja_scoping`.`customers`               │
-│ Table Properties ┆ [customer_ids=1, 2, 3, 4, transient_lastDdlTime=1793703269] │
+│ Table Properties ┆ [transient_lastDdlTime=1793703805] │                           <- naive
+│ Table Properties ┆ [customer_ids=1, 2, 3, 4, transient_lastDdlTime=1793703269] │  <- fixed
 ```
 
-In any SQL client connected to Spark, run the same statements without `dbt show`, for example `show tblproperties dbt_jinja_scoping.customers_commented`.
+In any SQL client connected to Spark, run the same statements without `dbt show`, for example `show tblproperties dbt_jinja_scoping.customers_commented_naive`.
 
 If the property doesn't show up:
 
+- **Check the view name.** `customers_commented` is the fixed view; the broken one is `customers_commented_naive`.
 - **Check the schema.** dbt 2 writes to `dbt_jinja_scoping`, and dbt-core writes to `dbt_jinja_scoping_core`.
 - **Keep `--limit -1`.** Without it, `dbt show` adds `limit 10`, and Spark rejects a `limit` after `show tblproperties` or `describe`.
 
