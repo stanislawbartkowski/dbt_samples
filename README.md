@@ -57,32 +57,66 @@ The results are the same on dbt 2.0.9 and dbt-core 1.11.16 with dbt-spark 1.11.0
 
 ### Reproduce it with dbt 2.0.9
 
+Set up the shell and build everything:
+
 ```bash
 source .venv/bin/activate
 set -a; source env_standard; set +a
 export DBT_PROFILES_DIR=.
 
 dbt build    # all models succeed, including customers_commented_naive
-
-for m in customers_commented customers_commented_append customers_commented_naive; do
-  dbt show --limit -1 --inline "show tblproperties {{ target.schema }}.$m ('customer_ids')"
-done
 ```
 
-The two fixed views show `1, 2, 3, 4`. The naive one shows an empty value:
+`dbt build` passes for all three models, so it can't tell you which hook is broken. Use one of the checks below.
+
+`dbt show --select customers_commented_naive` doesn't show the bug either. It returns the view's 4 customers, and they are correct: the model's SQL is just `select * from customers`. The bug is in the post-hook that runs after the view is created, and the only thing it writes is the view's `customer_ids` property.
+
+#### Scenario 1: the broken macro leaves the property empty
+
+```bash
+dbt show --limit -1 --inline "show tblproperties {{ target.schema }}.customers_commented_naive ('customer_ids')"
+```
 
 ```
 │ key          ┆ value │
 │ customer_ids ┆       │
 ```
 
-`--limit -1` matters: by default `dbt show` adds `limit 10` to the query, and Spark rejects a `limit` after `show tblproperties`.
+The loop added every id, but the list is empty after `{% endfor %}`.
 
-To see the SQL the hook ran, look in `logs/query_log.sql`, or run the model with `--log-level debug`:
+#### Scenario 2: the fixed macros record every id
 
 ```bash
-dbt run -s customers_commented_naive --log-level debug | grep "alter view"
-# alter view `dbt_jinja_scoping`.`customers_commented_naive` set tblproperties ('customer_ids' = '')
+dbt show --limit -1 --inline "show tblproperties {{ target.schema }}.customers_commented ('customer_ids')"
+dbt show --limit -1 --inline "show tblproperties {{ target.schema }}.customers_commented_append ('customer_ids')"
+```
+
+Both print:
+
+```
+│ key          ┆ value      │
+│ customer_ids ┆ 1, 2, 3, 4 │
+```
+
+`--limit -1` matters in both scenarios: by default `dbt show` adds `limit 10` to the query, and Spark rejects a `limit` after `show tblproperties`.
+
+#### Scenario 3: compare the SQL the hooks ran
+
+This check doesn't depend on where the hook saves its result. Run the broken and the fixed model with `--log-level debug`:
+
+```bash
+dbt run -s customers_commented_naive customers_commented --log-level debug | grep "alter view"
+```
+
+```
+alter view `dbt_jinja_scoping`.`customers_commented_naive` set tblproperties ('customer_ids' = '')
+alter view `dbt_jinja_scoping`.`customers_commented` set tblproperties ('customer_ids' = '1, 2, 3, 4')
+```
+
+dbt 2 also writes every statement it runs to `logs/query_log.sql`:
+
+```bash
+grep "alter view" logs/query_log.sql | tail -3
 ```
 
 ### Reproduce it with dbt-core 1.x
