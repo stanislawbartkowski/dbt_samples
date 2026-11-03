@@ -2,7 +2,7 @@
 
 This branch shows that `contract: {enforced: true}` is silently ignored on a custom materialization that writes its own DDL, and how to make a custom materialization enforce the contract.
 
-This branch uses the same dbt v2, Postgres and uv setup as [`concat_macro_overrides`](https://github.com/stanislawbartkowski/dbt_samples/tree/concat_macro_overrides), without the `concat` override. dbt-core 1.x runs through `uvx`; nothing extra is installed in the project. See [Setup](#setup) below.
+This branch uses the same dbt v2 and uv setup as [`concat_macro_overrides`](https://github.com/stanislawbartkowski/dbt_samples/tree/concat_macro_overrides), but on Spark (through Spark Connect) with Delta Lake instead of Postgres, and without the `concat` override. dbt-core 1.x runs through `uvx`; nothing extra is installed in the project. See [Setup](#setup) below.
 
 ## The problem
 
@@ -10,7 +10,7 @@ This branch uses the same dbt v2, Postgres and uv setup as [`concat_macro_overri
 
 `contract.enforced` is not checked by a generic wrapper around every materialization. The check is a macro, `get_assert_columns_equivalent(sql)`, which compares the columns the model's SQL returns with the columns declared in YAML: their names, data types and number. In dbt-core and dbt 2, it is called from the DDL macros the built-in materializations use:
 
-- `create_table_as`, used by `table` and `incremental`. On Postgres, it also builds the table from the contract's columns and constraints (`postgres__create_table_as`).
+- `create_table_as`, used by `table` and `incremental`. On Spark, `spark__create_table_as` also reorders the selected columns to match the contract.
 - `create_view_as`, used by `view`.
 
 A custom materialization that writes its own `create table ... as` never calls these macros, so nothing checks the contract. dbt doesn't raise an error or a warning. The model builds, and `contract.enforced: true` in the YAML looks like protection that isn't there.
@@ -53,34 +53,37 @@ models:
   - name: customers_contract_table
     config:
       materialized: table
+      file_format: delta
       contract: {enforced: true}
     columns: &contract_columns
       - name: customer_id
         data_type: bigint
       - name: first_name
-        data_type: text
+        data_type: string
       - name: last_name
-        data_type: text
+        data_type: string
 
   - name: customers_contract_rebuild_table_naive
     config:
       materialized: rebuild_table_naive
+      file_format: delta
       contract: {enforced: true}
     columns: *contract_columns
 
   - name: customers_contract_rebuild_table
     config:
       materialized: rebuild_table
+      file_format: delta
       contract: {enforced: true}
     columns: *contract_columns
 ```
 
-To break the contract on purpose, the models read the `break_contract` variable. With `--vars '{break_contract: true}'`, they return `customer_id` as `text` instead of `bigint`:
+To break the contract on purpose, the models read the `break_contract` variable. With `--vars '{break_contract: true}'`, they return `customer_id` as `string` instead of `bigint`:
 
 ```sql
 select
     {% if var('break_contract', false) -%}
-    cast(customer_id as text) as customer_id,
+    cast(customer_id as string) as customer_id,
     {%- else -%}
     customer_id,
     {%- endif %}
@@ -94,15 +97,15 @@ from {{ ref('customers') }}
 | Model | Materialization | Contract kept | Contract broken (`break_contract: true`) | `customer_id` in the database afterwards |
 | --- | --- | --- | --- | --- |
 | `customers_contract_table` | `table` | succeeds | **fails:** `data type mismatch` | `bigint` (old table kept) |
-| `customers_contract_rebuild_table_naive` | `rebuild_table_naive` | succeeds | **succeeds, silently** | **`text`** |
+| `customers_contract_rebuild_table_naive` | `rebuild_table_naive` | succeeds | **succeeds, silently** | **`string`** |
 | `customers_contract_rebuild_table` | `rebuild_table` | succeeds | **fails:** `data type mismatch` | `bigint` (old table kept) |
 
-The results are the same on dbt 2.0.9 and dbt-core 1.11.16. The failing models report:
+The results are the same on dbt 2.0.9 and dbt-core 1.11.16 with dbt-spark 1.11.0, tested on Spark 4.2.0 with Delta Lake 4.4.1. The failing models report:
 
 ```
 This model has an enforced contract that failed.
-| column_name | definition_type   | contract_type | mismatch_reason    |
-| customer_id | character varying | bigint        | data type mismatch |
+| column_name | definition_type | contract_type | mismatch_reason    |
+| customer_id | string          | bigint        | data type mismatch |
 ```
 
 ### Reproduce it with dbt 2.0.9
@@ -128,27 +131,29 @@ dbt run --vars '{break_contract: true}' -s customers_contract_table customers_co
 Check the column types in the database:
 
 ```bash
-dbt show --inline "select table_name, data_type from information_schema.columns
-  where table_schema = '{{ target.schema }}' and table_name like 'customers_contract%'
-    and column_name = 'customer_id' order by table_name"
+for m in customers_contract_table customers_contract_rebuild_table_naive customers_contract_rebuild_table; do
+  echo "$m: $(dbt show --limit -1 --inline "describe {{ target.schema }}.$m" | grep customer_id)"
+done
 ```
 
 ```
-│ table_name                             ┆ data_type │
-│ customers_contract_rebuild_table       ┆ bigint    │
-│ customers_contract_rebuild_table_naive ┆ text      │
-│ customers_contract_table               ┆ bigint    │
+customers_contract_table: │ customer_id ┆ bigint    ┆         │
+customers_contract_rebuild_table_naive: │ customer_id ┆ string    ┆         │
+customers_contract_rebuild_table: │ customer_id ┆ bigint    ┆         │
 ```
 
-The naive table now has `customer_id` as `text`, even though its contract says `bigint`. Run `dbt build` again to restore it.
+`--limit -1` matters: by default `dbt show` adds `limit 10` to the query, and Spark rejects a `limit` after `describe`.
+
+The naive table now has `customer_id` as `string`, even though its contract says `bigint`. Run `dbt build` again to restore it.
 
 ### Reproduce it with dbt-core 1.x
 
-`profiles_core/profiles.yml` uses the same Postgres with the schema `dbt_contracts_core`:
+dbt-spark has no Spark Connect method. Its `session` method uses PySpark, which connects to Spark Connect when `SPARK_REMOTE` is set. `profiles_core/profiles.yml` uses that, with the schema `dbt_contracts_core`:
 
 ```bash
+export SPARK_REMOTE=sc://localhost:15002
 export DBT_PROFILES_DIR=profiles_core
-CORE="uvx --python 3.11 --from dbt-core~=1.11.0 --with dbt-postgres~=1.11.0 dbt"
+CORE="uvx --python 3.12 --from dbt-core~=1.11.0 --with dbt-spark[session]~=1.10 --with pyspark[connect]==4.2.0 dbt"
 
 $CORE deps
 $CORE build --target-path target_core
@@ -162,15 +167,16 @@ $CORE run --target-path target_core --vars '{break_contract: true}' -s customers
 
 ## How the fix works
 
-- **`get_create_table_as_sql` already enforces the contract.** It dispatches to the adapter's `create_table_as`, which calls `get_assert_columns_equivalent(sql)` and builds the table from the contract's columns. Reusing it is the simplest way to get the same enforcement as `table`.
+- **`get_create_table_as_sql` already enforces the contract.** It dispatches to the adapter's `create_table_as`, which calls `get_assert_columns_equivalent(sql)` and selects the columns in the contract's order. Reusing it is the simplest way to get the same enforcement as `table`.
 - **Check before you drop.** `get_create_table_as_sql` raises only when the `create` statement is rendered. `rebuild_table` drops the old table first, so on its own it would drop the table and then fail, leaving no table at all. The explicit `get_assert_columns_equivalent(sql)` at the top of the materialization fails before anything changes, so the old table survives. This runs the check twice, which costs one extra metadata query.
-- **Writing your own DDL?** Then call `get_assert_columns_equivalent(sql)` yourself when `config.get('contract').enforced` is true. To also enforce constraints such as `not_null`, build the column list with `get_table_columns_and_constraints()`, as `postgres__create_table_as` does.
+- **Writing your own DDL?** Then call `get_assert_columns_equivalent(sql)` yourself when `config.get('contract').enforced` is true. Constraints such as `not_null` are a separate step on Spark: the built-in `table` materialization calls `persist_constraints(target_relation, model)` after the `create`, and it only applies them to Delta tables. Call it in your materialization too if your contracts have constraints.
 
 ## Notes
 
 - **Document which materializations enforce contracts.** dbt doesn't warn about a contract that nothing checks. Make it a rule for your internal packages: either a materialization enforces contracts, or its docs say that it doesn't.
-- **Commit in custom materializations.** dbt-core runs a materialization's statements in a transaction. Without `{{ adapter.commit() }}`, dbt-core reports `OK` and then rolls the transaction back, so the table never appears. dbt 2.0.9 commits anyway, so the bug only shows up on dbt-core.
-- **Seed types differ between engines.** dbt-core 1.11 loads `customer_id` from `seeds/customers.csv` as `integer`, and dbt 2.0.9 loads it as `bigint`. With a `bigint` contract, the correct models failed on dbt-core. `dbt_project.yml` pins the type with `column_types: {customer_id: bigint}`.
+- **Delta keeps the old table.** Without `file_format: delta` (or `iceberg`), the built-in Spark `table` materialization drops the old table before it runs the `create`, so a failed contract check leaves no table at all. With Delta, it uses `create or replace table` and the old table survives. The models here use Delta so that `table` and `rebuild_table` behave the same.
+- **Commit in custom materializations.** Spark has no transactions, so `{{ adapter.commit() }}` does nothing here. Keep it anyway: on adapters with transactions, such as Postgres, dbt-core reports `OK` without it and then rolls the transaction back, so the table never appears.
+- **Pin seed types.** On Postgres, dbt-core 1.11 loads `customer_id` from `seeds/customers.csv` as `integer` and dbt 2.0.9 as `bigint`, which broke a `bigint` contract on the correct models. `dbt_project.yml` pins the type with `column_types: {customer_id: bigint}`, so the contract doesn't depend on type inference.
 
 ## Project layout
 
@@ -179,17 +185,26 @@ $CORE run --target-path target_core --vars '{break_contract: true}' -s customers
 | `seeds/customers.csv` | Sample customer data loaded with `dbt seed` (`customer_id` pinned to `bigint` in `dbt_project.yml`) |
 | `models/customer_full_names.sql` | View that combines first and last name into `full_name` |
 | `packages/warehouse_materializations/macros/rebuild_table.sql` | The custom materializations `rebuild_table_naive` and `rebuild_table` |
-| `models/customers_contract.yml` | The same enforced contract on `table`, `rebuild_table_naive` and `rebuild_table` |
+| `models/customers_contract.yml` | The same enforced contract on `table`, `rebuild_table_naive` and `rebuild_table`, all Delta |
 | `models/customers_contract_*.sql` | The three models; `--vars '{break_contract: true}'` breaks the contract |
 | `packages.yml` | dbt package dependencies (`dbt-labs/dbt_utils` 1.x and the local `warehouse_materializations`) |
 | `pyproject.toml` / `uv.lock` | Python environment; pins `dbt==2.0.9` |
 | `env_standard` | Environment variables the project needs (see below) |
-| `profiles.yml` | dbt v2 connection to a local Postgres (generic `dbt` / `secret` credentials), schema `dbt_contracts` |
-| `profiles_core/profiles.yml` | dbt-core 1.x connection, schema `dbt_contracts_core` |
+| `profiles.yml` | dbt v2 connection to Spark Connect on `localhost:15002`, schema `dbt_contracts` |
+| `profiles_core/profiles.yml` | dbt-core 1.x connection through PySpark, schema `dbt_contracts_core` |
 
 ## Prerequisites
 
-- A running Postgres instance (by default `localhost:5432`, database `dbt_edu`)
+- A Spark Connect server with Delta Lake on `localhost:15002`. This branch was tested with Spark 4.2.0 and Delta Lake 4.4.1; the Delta version must match the Spark version. For example:
+
+  ```bash
+  $SPARK_HOME/sbin/start-connect-server.sh \
+    --packages org.apache.spark:spark-connect_2.13:4.2.0,io.delta:delta-spark_2.13:4.4.1 \
+    --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
+    --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
+    --conf spark.sql.catalogImplementation=hive
+  ```
+
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
 
 ## Setup
@@ -201,22 +216,21 @@ $CORE run --target-path target_core --vars '{break_contract: true}' -s customers
    uv run dbt --version   # dbt 2.0.9
    ```
 
-2. **Check `profiles.yml`.** It is included and points to a local Postgres with generic credentials. If your database is set up differently, change these settings:
+2. **Check `profiles.yml`.** It is included and points to Spark Connect on `localhost:15002`:
 
    ```yaml
    dbt_utils_demo:
-     target: dev
      outputs:
        dev:
-         type: postgres
-         host: localhost
-         port: 5432
-         user: dbt
-         password: secret   # dbt v2 requires `password`, not `pass`
-         dbname: dbt_edu
+         type: spark
+         method: spark-connect
+         host: "localhost:15002/;user_id=dbt"
          schema: dbt_contracts
          threads: 1
+     target: dev
    ```
+
+   dbt 2.0.9 builds the URL as `sc://<host>:<port>/`, and the Spark Connect client rejects the trailing `/`. Put the port and a user in `host`, as above, and leave out `port`.
 
 3. **Install dbt packages:**
 
@@ -232,7 +246,7 @@ $CORE run --target-path target_core --vars '{break_contract: true}' -s customers
 DBT_ALLOW_EXPERIMENTAL_ADAPTERS=true
 ```
 
-dbt v2 treats Postgres as an experimental adapter and refuses to run without this flag. If it is missing, dbt fails with `The 'postgres' adapter is not yet supported`.
+dbt v2 treats Spark as an experimental adapter and refuses to run without this flag. If it is missing, dbt fails with `The 'spark' adapter is not yet supported`.
 
 Load it in one of two ways:
 
@@ -269,8 +283,9 @@ To skip passing `--profiles-dir .` each time, run `export DBT_PROFILES_DIR=.`.
 
 | Error | Fix |
 | --- | --- |
-| `The 'postgres' adapter is not yet supported` | `env_standard` isn't loaded; see [Environment variables](#environment-variables) |
-| `missing field 'password'` | Rename `pass:` to `password:` in `profiles.yml` |
-| `bigint` / `integer` contract mismatch on a correct model | dbt-core and dbt 2 infer different seed types; pin them with `column_types` (see `dbt_project.yml`) |
-| A custom materialization runs `OK` on dbt-core but the table is missing | It never calls `adapter.commit()`; dbt-core rolls the transaction back |
+| `The 'spark' adapter is not yet supported` | `env_standard` isn't loaded; see [Environment variables](#environment-variables) |
+| `the URL path (/) must be empty or have a proper parameter syntax` | Put the port in `host` (`"localhost:15002/;user_id=dbt"`) and remove `port`; see [Setup](#setup) |
+| `Syntax error at or near 'limit'` from `dbt show` | Add `--limit -1` when the query is a `show ...` statement |
+| `bigint` / `integer` contract mismatch on a correct model | The engines infer seed types differently; pin them with `column_types` (see `dbt_project.yml`) |
+| A failed `table` model leaves no table | The model isn't Delta; set `file_format: delta` |
 | `Could not find profile named 'dbt_utils_demo'` | Pass `--profiles-dir .` or set `DBT_PROFILES_DIR` |

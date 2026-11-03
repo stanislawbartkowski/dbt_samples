@@ -1,26 +1,29 @@
-# The same contract on three materializations. With --vars '{break_contract: true}'
-# every model returns customer_id as text, which breaks the contract.
+# The same contract on three materializations, all Delta tables. With
+# --vars '{break_contract: true}' every model returns customer_id as string, which breaks the contract.
 models:
   - name: customers_contract_table
     config:
       materialized: table
+      file_format: delta
       contract: {enforced: true}
     columns: &contract_columns
       - name: customer_id
         data_type: bigint
       - name: first_name
-        data_type: text
+        data_type: string
       - name: last_name
-        data_type: text
+        data_type: string
 
   - name: customers_contract_rebuild_table_naive
     config:
       materialized: rebuild_table_naive
+      file_format: delta
       contract: {enforced: true}
     columns: *contract_columns
 
   - name: customers_contract_rebuild_table
     config:
       materialized: rebuild_table
+      file_format: delta
       contract: {enforced: true}
     columns: *contract_columns
