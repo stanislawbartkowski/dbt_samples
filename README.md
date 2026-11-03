@@ -1,6 +1,106 @@
-# dbt_utils_demo
+# dbt_utils_demo: Jinja loop scoping
 
-A small dbt v2 project for Postgres. It loads a `customers` seed and builds a `customer_full_names` view with dbt's `concat` macro. The project overrides `concat` to join fields with `' - '`. The `dbt_utils` package is installed as a dependency.
+This branch shows why a list built with `{% set %}` inside a `{% for %}` loop is empty after the loop, and two ways to fix it: `namespace()` and `{% do list.append() %}`.
+
+This branch uses the same dbt v2, Postgres and uv setup as [`concat_macro_overrides`](https://github.com/stanislawbartkowski/dbt_samples/tree/concat_macro_overrides), without the `concat` override. dbt-core 1.x runs through `uvx`; nothing extra is installed in the project. See [Setup](#setup) below.
+
+## The problem
+
+> "Our post-hook macro loops over query results and appends each id to a list. The values are clearly there inside the loop, but the list is always empty after it."
+
+This is standard Jinja scoping, not a dbt bug, and a global variable won't fix it. A `{% for %}` loop opens its own scope. `{% set found_ids = found_ids + [...] %}` inside the loop doesn't change the outer `found_ids`. It creates a new `found_ids` in the loop's scope. The next iteration starts again from the outer, empty list, and the inner one disappears at `{% endfor %}`. Python works differently: there a `for` loop doesn't open a new scope.
+
+`{% if %}` blocks don't open a scope. A `{% set %}` inside an `if` is visible after `{% endif %}`. The bug only happens in loops.
+
+## The example
+
+`macros/comment_with_ids.sql` has three post-hook macros. Each one reads the `customer_id`s from the view it runs on and stores them in a comment on the view. They differ only in how they build the list:
+
+```sql
+{# BROKEN: the set inside the loop binds a new found_ids that disappears at endfor #}
+{% set found_ids = [] %}
+{% for row in results %}
+  {% set found_ids = found_ids + [row['customer_id']] %}
+{% endfor %}
+comment on view {{ relation }} is 'customer_ids: {{ found_ids | join(", ") }}'
+
+{# FIXED: a namespace attribute set inside the loop is still visible after it #}
+{% set ns = namespace(found_ids=[]) %}
+{% for row in results %}
+  {% set ns.found_ids = ns.found_ids + [row['customer_id']] %}
+{% endfor %}
+comment on view {{ relation }} is 'customer_ids: {{ ns.found_ids | join(", ") }}'
+
+{# ALSO FIXED: append mutates the list in place instead of rebinding the name #}
+{% set found_ids = [] %}
+{% for row in results %}
+  {% do found_ids.append(row['customer_id']) %}
+{% endfor %}
+comment on view {{ relation }} is 'customer_ids: {{ found_ids | join(", ") }}'
+```
+
+`namespace()` is Jinja's official fix. It works for any value, including counters, strings and flags (`{% set ns.total = ns.total + 1 %}`). `append` works because it changes the list object, not the name, but only for lists and dicts.
+
+Each macro is the post-hook of one model, and each model is `select * from {{ ref('customers') }}`:
+
+| Model | Post-hook | Comment on the view |
+| --- | --- | --- |
+| `customers_commented_naive` | `comment_with_ids_naive` | **`customer_ids: `** (empty) |
+| `customers_commented` | `comment_with_ids` (`namespace`) | `customer_ids: 1, 2, 3, 4` |
+| `customers_commented_append` | `comment_with_ids_append` | `customer_ids: 1, 2, 3, 4` |
+
+The results are the same on dbt 2.0.9 and dbt-core 1.11.16.
+
+**Nothing fails.** `dbt build` succeeds for all three models. The broken hook still produces valid SQL, just with an empty list. You only notice when you read the hook's SQL or the comment itself. This pattern is common in dbt macros, which often loop over `graph.nodes.values()`, query results or column lists to build SQL.
+
+**What to look for in code review:** a `{% set %}` inside a `{% for %}` loop that assigns a variable which is read after the loop. If you find one, use `namespace()`.
+
+### Reproduce it with dbt 2.0.9
+
+```bash
+source .venv/bin/activate
+set -a; source env_standard; set +a
+export DBT_PROFILES_DIR=.
+
+dbt build    # all models succeed, including customers_commented_naive
+
+dbt show --inline "select c.relname as view_name, obj_description(c.oid) as comment
+  from pg_class c join pg_namespace n on n.oid = c.relnamespace
+  where n.nspname = '{{ target.schema }}' and c.relname like 'customers_commented%' order by 1"
+```
+
+```
+│ view_name                  ┆ comment                  │
+│ customers_commented        ┆ customer_ids: 1, 2, 3, 4 │
+│ customers_commented_append ┆ customer_ids: 1, 2, 3, 4 │
+│ customers_commented_naive  ┆ customer_ids:            │
+```
+
+To see the SQL the hook ran, look in `logs/query_log.sql`, or run the model with `--log-level debug`:
+
+```bash
+dbt run -s customers_commented_naive --log-level debug | grep "comment on"
+# comment on view "dbt_edu"."dbt_jinja_scoping"."customers_commented_naive" is 'customer_ids: '
+```
+
+### Reproduce it with dbt-core 1.x
+
+`profiles_core/profiles.yml` uses the same Postgres with the schema `dbt_jinja_scoping_core`:
+
+```bash
+export DBT_PROFILES_DIR=profiles_core
+CORE="uvx --python 3.11 --from dbt-core~=1.11.0 --with dbt-postgres~=1.11.0 dbt"
+
+$CORE build --target-path target_core
+grep "comment on view" logs/dbt.log
+```
+
+`--target-path target_core` keeps the dbt-core manifest apart from the dbt v2 one in `target/`.
+
+## Notes
+
+- **Why `if execute`?** dbt renders the hooks while parsing too, when `run_query` returns nothing. The macros only run the query and output the `comment` statement when `execute` is true.
+- **What a `log` inside the loop shows.** Each iteration starts again from the outer, empty `found_ids`, so `{{ log(found_ids, info=true) }}` inside the loop prints `[1]`, `[2]`, `[3]`, not a growing list. After `{% endfor %}` it prints `[]`.
 
 ## Project layout
 
@@ -8,11 +108,15 @@ A small dbt v2 project for Postgres. It loads a `customers` seed and builds a `c
 | --- | --- |
 | `seeds/customers.csv` | Sample customer data loaded with `dbt seed` |
 | `models/customer_full_names.sql` | View that combines first and last name into `full_name` |
-| `macros/concat.sql` | Overrides `dbt.concat` on Postgres to join fields with `' - '` |
+| `macros/comment_with_ids.sql` | `comment_with_ids_naive`, `comment_with_ids` (`namespace`) and `comment_with_ids_append` |
+| `models/customers_commented_naive.sql` | View with the broken post-hook |
+| `models/customers_commented.sql` | View with the `namespace` post-hook |
+| `models/customers_commented_append.sql` | View with the `append` post-hook |
 | `packages.yml` | dbt package dependencies (`dbt-labs/dbt_utils` 1.x) |
-| `pyproject.toml` / `uv.lock` | Python environment; pins `dbt==2.0.8` |
+| `pyproject.toml` / `uv.lock` | Python environment; pins `dbt==2.0.9` |
 | `env_standard` | Environment variables the project needs (see below) |
-| `profiles.yml` | Connection settings for a local Postgres (generic `dbt` / `secret` credentials) |
+| `profiles.yml` | dbt v2 connection to a local Postgres (generic `dbt` / `secret` credentials), schema `dbt_jinja_scoping` |
+| `profiles_core/profiles.yml` | dbt-core 1.x connection, schema `dbt_jinja_scoping_core` |
 
 ## Prerequisites
 
@@ -25,7 +129,7 @@ A small dbt v2 project for Postgres. It loads a `customers` seed and builds a `c
 
    ```bash
    uv sync
-   uv run dbt --version   # dbt 2.0.8
+   uv run dbt --version   # dbt 2.0.9
    ```
 
 2. **Check `profiles.yml`.** It is included and points to a local Postgres with generic credentials. If your database is set up differently, change these settings:
@@ -41,7 +145,7 @@ A small dbt v2 project for Postgres. It loads a `customers` seed and builds a `c
          user: dbt
          password: secret   # dbt v2 requires `password`, not `pass`
          dbname: dbt_edu
-         schema: dbt_utils_demo
+         schema: dbt_jinja_scoping
          threads: 1
    ```
 
@@ -86,60 +190,11 @@ dbt deps --profiles-dir .                        # install packages from package
 dbt seed --profiles-dir .                        # load seeds/customers.csv
 dbt run --profiles-dir .                         # build models
 dbt build --profiles-dir .                       # seed + run + test, in order
-dbt show --profiles-dir . -s customer_full_names # preview model output
+dbt show --profiles-dir . -s customer_full_names # preview a model
 dbt clean --profiles-dir .                       # remove target/ and dbt_packages/
 ```
 
 To skip passing `--profiles-dir .` each time, run `export DBT_PROFILES_DIR=.`.
-
-### Example: preview `customer_full_names`
-
-```bash
-uv run --env-file env_standard dbt show --profiles-dir . --select customer_full_names
-```
-
-Output (first rows):
-
-```
-│ customer_id ┆ first_name ┆ last_name ┆ full_name     │
-╞═════════════╪════════════╪═══════════╪═══════════════╡
-│ 1           ┆ John       ┆ Doe       ┆ John - Doe    │
-│ 2           ┆ Jane       ┆ Smith     ┆ Jane - Smith  │
-│ 3           ┆ Alice      ┆ Brown     ┆ Alice - Brown │
-```
-
-### Custom `concat` separator
-
-`macros/concat.sql` defines `postgres__concat`. dbt checks this project's macros before its own, so every `dbt.concat([...])` call joins its fields with `' - '`:
-
-```sql
-{{ dbt.concat(['first_name', 'last_name']) }}   -- compiles to: first_name || ' - ' || last_name
-```
-
-#### How the override works
-
-dbt's built-in `concat` doesn't contain any SQL. It passes the call to a database-specific macro:
-
-```sql
-{% macro concat(fields) %}
-  {{ return(adapter.dispatch('concat', 'dbt')(fields)) }}
-{% endmacro %}
-```
-
-On Postgres, dbt looks for these macros in order and uses the first one it finds:
-
-1. `postgres__concat` in **this project** ← our override
-2. `default__concat` in **this project**
-3. `postgres__concat` in **dbt**
-4. `default__concat` in **dbt**
-
-This project defines `postgres__concat`, so dbt uses it and never calls its own version. Models don't need any changes: they still call `dbt.concat`. To make the override apply on every database, not just Postgres, name the macro `default__concat` instead.
-
-Run `dbt compile -s customer_full_names` to see the SQL it produces.
-
-The override also applies inside packages: `dbt_utils.generate_surrogate_key` produces different hashes than it would with dbt's default `concat`. It also changes null handling. The override uses `||`, so if any field is null, the result is null. dbt's default `concat` skips nulls instead.
-
-`dbt show` returns 10 rows by default. Use `--limit 20` to change that, or `--limit -1` to show all rows.
 
 ## Troubleshooting
 
@@ -147,5 +202,5 @@ The override also applies inside packages: `dbt_utils.generate_surrogate_key` pr
 | --- | --- |
 | `The 'postgres' adapter is not yet supported` | `env_standard` isn't loaded; see [Environment variables](#environment-variables) |
 | `missing field 'password'` | Rename `pass:` to `password:` in `profiles.yml` |
-| `the concat macro is now provided in dbt Core` | Use `{{ dbt.concat(...) }}` instead of `{{ dbt_utils.concat(...) }}` |
+| Comment is `customer_ids: ` with no ids | A `{% set %}` inside a `for` loop rebinds the list; use `namespace()` or `{% do list.append() %}` |
 | `Could not find profile named 'dbt_utils_demo'` | Pass `--profiles-dir .` or set `DBT_PROFILES_DIR` |
