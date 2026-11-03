@@ -16,3 +16,10 @@ clean-targets:
 models:
   dbt_utils_demo:
     +materialized: view
+
+seeds:
+  dbt_utils_demo:
+    customers:
+      # dbt-core 1.x infers integer and dbt 2 infers bigint; pin it so the contracts match on both
+      +column_types:
+        customer_id: bigint
