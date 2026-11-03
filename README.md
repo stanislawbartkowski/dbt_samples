@@ -94,6 +94,40 @@ dbt build    # all models succeed, including customers_commented_naive
 
 `dbt show --select customers_commented_naive` doesn't show the bug either. It returns the view's 4 customers, and they are correct: the model's SQL is just `select * from customers`. The bug is in the post-hook that runs after the view is created, and the only thing it writes is the view's `customer_ids` property.
 
+#### Where to find the `customer_ids` property
+
+`customer_ids` is not a column. It is metadata stored on the view in the Spark catalog, so `select * from customers_commented` and `dbt show --select customers_commented` don't show it. Use Spark's metadata commands instead.
+
+List the view's properties:
+
+```bash
+dbt show --limit -1 --inline "show tblproperties {{ target.schema }}.customers_commented"
+```
+
+```
+│ key                   ┆ value      │
+│ customer_ids          ┆ 1, 2, 3, 4 │
+│ transient_lastDdlTime ┆ 1793703269 │
+```
+
+Or read it with the rest of the view's metadata, in the `Table Properties` row:
+
+```bash
+dbt show --limit -1 --inline "describe table extended {{ target.schema }}.customers_commented"
+```
+
+```
+│ View Text        ┆ select * from `dbt_jinja_scoping`.`customers`               │
+│ Table Properties ┆ [customer_ids=1, 2, 3, 4, transient_lastDdlTime=1793703269] │
+```
+
+In any SQL client connected to Spark, run the same statements without `dbt show`, for example `show tblproperties dbt_jinja_scoping.customers_commented`.
+
+If the property doesn't show up:
+
+- **Check the schema.** dbt 2 writes to `dbt_jinja_scoping`, and dbt-core writes to `dbt_jinja_scoping_core`.
+- **Keep `--limit -1`.** Without it, `dbt show` adds `limit 10`, and Spark rejects a `limit` after `show tblproperties` or `describe`.
+
 #### Scenario 1: the broken macro leaves the property empty
 
 ```bash
