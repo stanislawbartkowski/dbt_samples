@@ -19,7 +19,7 @@ A common explanation goes like this:
 Parts of it are right:
 
 - **On Postgres, the contract check doesn't compare precision or scale.** dbt runs the model's SQL and an empty query built from the YAML types, and compares the column types the database reports for each. psycopg2 reports `numeric` for every precision, so `numeric(38,2)` and `numeric(38,0)` look the same.
-- **dbt warns about bare `numeric`.** Both dbt-core 1.11.17 and dbt 2.0.9 print `Detected columns with numeric type and unspecified precision/scale, this can lead to unintended rounding`.
+- **dbt warns about bare `numeric`.** Both dbt-core 1.11.17 and dbt 2.0.11 print `Detected columns with numeric type and unspecified precision/scale, this can lead to unintended rounding`.
 
 Other parts don't hold:
 
@@ -64,7 +64,7 @@ Each `order_total` has a `sum_matches` test, which checks that the column adds u
 | `dim_customers_scale_0` | **succeeds silently,** rounds to whole numbers; `sum_matches` fails | same | **contract fails:** `decimal(38,2)` ≠ `decimal(38,0)` |
 | `dim_customers_precision_10` | **succeeds silently** | **fails:** `numeric field overflow` | **contract fails:** `decimal(38,2)` ≠ `decimal(10,2)` |
 
-The results are the same on dbt 2.0.9 and on dbt-core 1.11.17 (dbt-adapters 1.24.5, dbt-postgres 1.11.0, dbt-spark 1.11.0), tested on Postgres 14 and on Spark 4.2.0 with Delta Lake 4.4.1.
+The results are the same on dbt 2.0.11 and on dbt-core 1.11.17 (dbt-adapters 1.24.5, dbt-postgres 1.11.0, dbt-spark 1.11.0), tested on Postgres 14 and on Spark 4.2.0 with Delta Lake 4.4.1.
 
 `dim_customers_precision_10` is the scenario from the quote: it passes review and the dev build, then fails in prod. `dim_customers_scale_0` is worse: it never fails. Only a test of the values finds it:
 
@@ -76,7 +76,7 @@ The results are the same on dbt 2.0.9 and on dbt-core 1.11.17 (dbt-adapters 1.24
            3 |          7.25 |                     7
 ```
 
-### Reproduce it with dbt 2.0.9
+### Reproduce it with dbt 2.0.11
 
 ```bash
 source .venv/bin/activate
@@ -147,7 +147,7 @@ The contract check is the `assert_columns_equivalent` macro in dbt-adapters. It 
 
 It asks the database for the column types of each, and compares them as strings.
 
-- **Postgres:** dbt-postgres reads the types from the psycopg2 cursor description, which gives a type code. The code for `numeric` is the same for every precision and scale, so both sides become `numeric`. dbt 2.0.9 doesn't use psycopg2, but its comparison drops precision and scale on Postgres too.
+- **Postgres:** dbt-postgres reads the types from the psycopg2 cursor description, which gives a type code. The code for `numeric` is the same for every precision and scale, so both sides become `numeric`. dbt 2.0.11 doesn't use psycopg2, but its comparison drops precision and scale on Postgres too.
 - **Spark:** dbt reads the types from Spark's schema, which includes precision and scale: `decimal(38,2)`.
 
 When the check passes, dbt creates the table with the types from the contract, not from the query, and inserts the query's rows into it. Postgres then converts each value to the column's type: it rounds to the column's scale, and fails if the value has too many digits for the precision.
@@ -161,7 +161,7 @@ When the check passes, dbt creates the table with the types from the contract, n
   dbt build --warn-error-options '{"error": ["JinjaLogWarning"]}'
   ```
 
-  This works on dbt-core 1.11.17 and dbt 2.0.9 (which also accepts `JinjaWarn`). It covers every warning raised from Jinja, not only this one.
+  This works on dbt-core 1.11.17 and dbt 2.0.11 (which also accepts `JinjaWarn`). It covers every warning raised from Jinja, not only this one.
 - **On Postgres, don't rely on the contract to check precision or scale.** A passing contract means the column names and base types match. Review changes to `data_type` in the YAML as carefully as SQL changes.
 - **Test the values.** A reconciliation test such as `sum_matches` catches rounding that no type check sees. To catch overflow before prod does, make sure the CI data includes the largest values that prod has.
 
@@ -187,7 +187,7 @@ It returns one row with both totals when they differ, for example `74` and `74.7
 
    ```bash
    uv sync
-   uv run dbt --version   # dbt 2.0.9
+   uv run dbt --version   # dbt 2.0.11
    ```
 
 2. **Check `profiles.yml`.** It is included and has two outputs. `postgres` is the default target; select Spark with `--target spark`:
@@ -207,13 +207,14 @@ It returns one row with both totals when they differ, for example `74` and `74.7
        spark:
          type: spark
          method: spark-connect
-         host: "localhost:15002/;user_id=dbt"
+         host: localhost
+         port: 15002
          schema: dbt_numeric_precision
          threads: 1
      target: postgres
    ```
 
-   Change the Postgres credentials to match your server. For Spark, dbt 2.0.9 builds the URL as `sc://<host>:<port>/`, and the Spark Connect client rejects the trailing `/`. Put the port and a user in `host`, as above, and leave out `port`.
+   Change the Postgres credentials to match your server. For Spark, use a plain `host` and `port`, as above. dbt 2.0.9 needed a workaround (`host: "localhost:15002/;user_id=dbt"` without `port`); dbt 2.0.11 rejects it.
 
 3. **Install dbt packages:**
 
@@ -255,7 +256,7 @@ Load it in one of two ways:
 | `This model has an enforced contract that failed` with `data type mismatch` | Expected on Spark for every model except `dim_customers` |
 | `sum_matches_dim_customers_scale_0_...` fails | Expected on Postgres: the contract passed and the values were rounded |
 | `The 'postgres' adapter is not yet supported` (or `'spark'`) | `env_standard` isn't loaded; see [Environment variables](#environment-variables) |
-| `the URL path (/) must be empty or have a proper parameter syntax` | Put the port in `host` (`"localhost:15002/;user_id=dbt"`) and remove `port`; see [Setup](#setup) |
+| `Could not parse Spark Connect port: strconv.Atoi: parsing "15002/;user_id=dbt"` | The profile still has the dbt 2.0.9 workaround; use `host: localhost` and `port: 15002`; see [Setup](#setup) |
 | `Ignored unexpected key "2)"` | A type such as `numeric(38,2)` inside an inline YAML list or map (`[...]`, `{...}`); put it in quotes, or use block YAML |
 | `Could not find profile named 'dbt_utils_demo'` | Pass `--profiles-dir .` or set `DBT_PROFILES_DIR` |
 
@@ -276,7 +277,7 @@ Load it in one of two ways:
 | `models/marts/dim_customers.yml` | Their contracts, which differ only in the type of `order_total` |
 | `tests/generic/sum_matches.sql` | Generic test that compares a column's total with a column in another model |
 | `packages.yml` | dbt package dependencies (`dbt-labs/dbt_utils` 1.x) |
-| `pyproject.toml` / `uv.lock` | Python environment; pins `dbt==2.0.9` |
+| `pyproject.toml` / `uv.lock` | Python environment; pins `dbt==2.0.11` |
 | `env_standard` | Environment variables the project needs (see above) |
 | `profiles.yml` | dbt v2 connections: Postgres (default) and Spark Connect on `localhost:15002`, schema `dbt_numeric_precision` |
 | `profiles_core/profiles.yml` | dbt-core 1.x connections: Postgres and Spark through PySpark, schema `dbt_numeric_precision_core` |
