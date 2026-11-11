@@ -13,19 +13,27 @@ clean-targets:
   - "target"
   - "dbt_packages"
 
+vars:
+  # false: the dev sample, without the large order. true: all orders, like prod.
+  prod_data: false
+
 models:
   dbt_utils_demo:
     +materialized: view
+    marts:
+      +materialized: table
+      # Spark builds tables as Delta; Postgres ignores file_format
+      +file_format: delta
 
 seeds:
   dbt_utils_demo:
+    # Pin the types so the contracts don't depend on type inference, which
+    # differs between dbt versions and between Postgres and Spark
     customers:
-      # dbt-core 1.x infers integer and dbt 2 infers bigint; pin it so the contracts match on both
       +column_types:
         customer_id: bigint
     orders:
       +column_types:
         order_id: bigint
         customer_id: bigint
-        amount: decimal(10,2)
-        status: string
+        amount: decimal(38,2)

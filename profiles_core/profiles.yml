@@ -3,10 +3,19 @@
 # SPARK_REMOTE=sc://localhost:15002 is set.
 dbt_utils_demo:
   outputs:
-    dev:
+    postgres:
+      type: postgres
+      host: localhost
+      port: 5432
+      user: dbt
+      password: secret
+      dbname: dbt_edu
+      schema: dbt_numeric_precision_core
+      threads: 1
+    spark:
       type: spark
       method: session
       host: NA
-      schema: dbt_schema_change_core
+      schema: dbt_numeric_precision_core
       threads: 1
-  target: dev
+  target: postgres

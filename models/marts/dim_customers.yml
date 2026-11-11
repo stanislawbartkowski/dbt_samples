@@ -1,0 +1,70 @@
+# Four models with the same SQL. order_total is always numeric(38, 2) in the
+# query; only the type in the contract changes.
+models:
+  # The reviewed contract
+  - name: dim_customers
+    config:
+      contract: {enforced: true}
+    columns:
+      - name: customer_id
+        data_type: bigint
+      - name: order_count
+        data_type: bigint
+      - name: order_total
+        data_type: numeric(38,2)
+        data_tests:
+          - sum_matches:
+              arguments:
+                compare_model: ref('stg_orders')
+                compare_column: amount
+
+  # The PR: numeric(38,2) -> bare numeric
+  - name: dim_customers_bare_numeric
+    config:
+      contract: {enforced: true}
+    columns:
+      - name: customer_id
+        data_type: bigint
+      - name: order_count
+        data_type: bigint
+      - name: order_total
+        data_type: numeric
+        data_tests:
+          - sum_matches:
+              arguments:
+                compare_model: ref('stg_orders')
+                compare_column: amount
+
+  # What bare numeric means on Snowflake: scale 0
+  - name: dim_customers_scale_0
+    config:
+      contract: {enforced: true}
+    columns:
+      - name: customer_id
+        data_type: bigint
+      - name: order_count
+        data_type: bigint
+      - name: order_total
+        data_type: numeric(38,0)
+        data_tests:
+          - sum_matches:
+              arguments:
+                compare_model: ref('stg_orders')
+                compare_column: amount
+
+  # Too little precision for the largest totals
+  - name: dim_customers_precision_10
+    config:
+      contract: {enforced: true}
+    columns:
+      - name: customer_id
+        data_type: bigint
+      - name: order_count
+        data_type: bigint
+      - name: order_total
+        data_type: numeric(10,2)
+        data_tests:
+          - sum_matches:
+              arguments:
+                compare_model: ref('stg_orders')
+                compare_column: amount
