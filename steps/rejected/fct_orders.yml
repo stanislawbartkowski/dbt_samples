@@ -1,0 +1,27 @@
+# Same contract as steps/1_initial, but with the two on_schema_change values
+# that dbt rejects on an incremental model with an enforced contract.
+models:
+  - name: fct_orders_append_new_columns
+    config: &incremental
+      materialized: incremental
+      incremental_strategy: merge
+      unique_key: order_id
+      file_format: delta
+      contract: {enforced: true}
+      on_schema_change: ignore            # rejected
+    data_tests: &contract_tests
+      - matches_contract
+    columns: &contract_columns
+      - name: order_id
+        data_type: bigint
+      - name: customer_id
+        data_type: bigint
+      - name: amount
+        data_type: decimal(10,2)
+
+  - name: fct_orders_fail
+    config:
+      <<: *incremental
+      on_schema_change: sync_all_columns  # rejected
+    data_tests: *contract_tests
+    columns: *contract_columns

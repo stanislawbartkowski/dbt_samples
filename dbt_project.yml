@@ -23,3 +23,9 @@ seeds:
       # dbt-core 1.x infers integer and dbt 2 infers bigint; pin it so the contracts match on both
       +column_types:
         customer_id: bigint
+    orders:
+      +column_types:
+        order_id: bigint
+        customer_id: bigint
+        amount: decimal(10,2)
+        status: string

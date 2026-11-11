@@ -7,6 +7,6 @@ dbt_utils_demo:
       type: spark
       method: session
       host: NA
-      schema: dbt_contracts_core
+      schema: dbt_schema_change_core
       threads: 1
   target: dev
