@@ -1,14 +1,14 @@
 # dbt_utils_demo: why Slim CI rebuilds more, or less, than it should
 
-This branch tests three common explanations for a Slim CI job (`dbt build --select state:modified+ --state <prod manifest>`) that rebuilds the whole DAG on every PR. It runs each one on dbt-core 1.11.17 and on dbt 2.0.11:
+This branch tests three common explanations for a Slim CI job (`dbt build --select state:modified+ --state <prod manifest>`) that rebuilds the whole DAG on every PR. It runs each one on dbt 2.0.11:
 
-- **`--state` and `--target-path` in the same directory make Slim CI build too little, not too much.** dbt overwrites the prod manifest with the PR's own manifest, so nothing looks modified and the changed model isn't built at all. dbt-core does this on the first command and prints a warning. dbt 2.0.11 compares correctly on the first command, then overwrites the manifest, so every later command in the same job silently selects nothing.
-- **Configs that depend on `target.name` are false positives only on dbt-core, and only when they're set in `config()` or in properties YAML.** Configs in `dbt_project.yml` are always compared unrendered. `state_modified_compare_more_unrendered_values: true` fixes the rest on dbt-core 1.9 to 1.11. dbt 2.0.11 doesn't have the problem, with or without the flag.
-- **A shared macro edit is the cause that really rebuilds everything.** A comment added inside a macro that every model calls marks every model as `state:modified.macros`, on both versions.
+- **`--state` and `--target-path` in the same directory make Slim CI build too little, not too much.** The first command still compares against the prod manifest, then overwrites it with the PR's own manifest. Every later command in the same job compares the PR with itself, selects nothing, and prints no warning.
+- **Configs that depend on `target.name` aren't false positives.** dbt 2.0.11 compares the unrendered config, the Jinja text, so `table` in prod and `view` in CI don't count as a change. `state_modified_compare_more_unrendered_values` has no effect.
+- **A shared macro edit is the cause that really rebuilds everything.** A comment added inside a macro that every model calls marks every model as `state:modified.macros`.
 
 Diagnose before you change anything: run `dbt ls --select state:modified --state <prod manifest>`, then the sub-selectors (`state:modified.body`, `.configs`, `.macros`, and others) to see *why* each model is selected. See [Diagnose it](#diagnose-it).
 
-This branch uses the same dbt v2 and uv setup as [`concat_macro_overrides`](https://github.com/stanislawbartkowski/dbt_samples/tree/concat_macro_overrides), with two Postgres targets: `prod` and `ci`. dbt-core 1.x runs through `uvx`; nothing extra is installed in the project. See [Setup](#setup) below.
+This branch uses the same dbt v2 and uv setup as [`concat_macro_overrides`](https://github.com/stanislawbartkowski/dbt_samples/tree/concat_macro_overrides), with two Spark targets (through Spark Connect, with Delta Lake): `prod` and `ci`. See [Setup](#setup) below.
 
 ## The problem
 
@@ -18,15 +18,13 @@ A common explanation goes like this:
 
 Parts of it are right:
 
-- **A shared state and target directory loses the prod manifest.** dbt-core even warns about it: `The state and target directories are the same`.
-- **Target-dependent configs are false positives on dbt-core with the flag off**, and the flag fixes them.
+- **A shared state and target directory loses the prod manifest.** After the first dbt command, `target/manifest.json` is the PR's manifest.
 - **A macro edit marks every model that calls the macro**, even when the edit is a comment.
 
 Other parts don't hold:
 
-- **A shared directory never makes everything look new.** It makes everything look unmodified: the PR's change isn't built or tested, and CI passes. A missing prod manifest doesn't rebuild everything either. It's an error on both versions.
-- **It isn't every model with a target-dependent config.** Even with the flag off, dbt-core compares configs set in `dbt_project.yml` unrendered. Only configs set in a model's `config()` block or in properties YAML are compared rendered.
-- **It isn't every dbt version.** dbt 2.0.11 always compares the unrendered value, so the flag changes nothing there.
+- **A shared directory never makes everything look new.** It makes everything look unmodified: the PR's change isn't built or tested, and CI passes. A missing prod manifest doesn't rebuild everything either. It's an error.
+- **Target-dependent configs aren't false positives on dbt 2.0.11.** It compares unrendered values, wherever the config is set: `dbt_project.yml`, `config()` or properties YAML. The flag makes no difference.
 
 ## The example
 
@@ -58,19 +56,19 @@ The prod job writes its manifest with `dbt parse --target prod --target-path pro
 
 Each cell lists the models that `state:modified` selects.
 
-| Scenario | Expected | dbt-core 1.11.17 | dbt 2.0.11 |
-| --- | --- | --- | --- |
-| **1.** One-line change to `fct_orders`, `--state prod-state` | `fct_orders` | `fct_orders` | `fct_orders` |
-| **1.** Same change, prod manifest copied into `target/`, `--state target` | `fct_orders` | **nothing**, warning | `fct_orders` |
-| **1.** The next command in the same job, `--state target` | `fct_orders` | **nothing**, warning | **nothing**, no warning |
-| **2.** No change, flag `false` | nothing | **`customer_revenue`, `fct_orders`** (`.configs`) | nothing |
-| **2.** No change, flag `true` | nothing | nothing | nothing |
-| **3.** Jinja comment added inside `audit_columns()` | all five (`.macros`) | all five (`.macros`) | all five (`.macros`) |
-| **3.** Same comment above the `{% macro %}` block | nothing | nothing | nothing |
+| Scenario | Expected | dbt 2.0.11 |
+| --- | --- | --- |
+| **1.** One-line change to `fct_orders`, `--state prod-state` | `fct_orders` | `fct_orders` |
+| **1.** Same change, prod manifest copied into `target/`, `--state target` | `fct_orders` | `fct_orders` |
+| **1.** The next command in the same job, `--state target` | `fct_orders` | **nothing**, no warning |
+| **2.** No change, flag `false` | nothing | nothing |
+| **2.** No change, flag `true` | nothing | nothing |
+| **3.** Jinja comment added inside `audit_columns()` | all five (`.macros`) | all five (`.macros`) |
+| **3.** Same comment above the `{% macro %}` block | nothing | nothing |
 
-"Flag" is `state_modified_compare_more_unrendered_values` in `dbt_project.yml`. `dim_customers` is never selected in scenario 2: its config comes from `dbt_project.yml`. Tested on Postgres 14.
+"Flag" is `state_modified_compare_more_unrendered_values` in `dbt_project.yml`. Tested on Spark 4.2.0 with Delta Lake 4.4.1. The results were the same on Postgres 14.
 
-### Reproduce it with dbt 2.0.11
+### Reproduce it
 
 ```bash
 source .venv/bin/activate
@@ -91,11 +89,14 @@ dbt deps
     state:modified -> (nothing)
 
 == Cause 2: configs that depend on target.name
-  ...
+  No change at all. fct_orders sets materialized in config(),
+  customer_revenue in marts.yml, dim_customers in dbt_project.yml.
   state_modified_compare_more_unrendered_values: false
     state:modified -> (nothing)
     state:modified.configs -> (nothing)
-  ...
+  state_modified_compare_more_unrendered_values: true
+    state:modified -> (nothing)
+    state:modified.configs -> (nothing)
 
 == Cause 3: a comment added inside a shared macro
     state:modified -> customer_revenue dim_customers fct_orders stg_customers stg_orders
@@ -103,33 +104,6 @@ dbt deps
     state:modified.macros -> customer_revenue dim_customers fct_orders stg_customers stg_orders
   The same comment above the {% macro %} block instead:
     state:modified -> (nothing)
-```
-
-### Reproduce it with dbt-core 1.x
-
-`profiles_core/profiles.yml` uses the schemas `dbt_slim_ci_prod_core` and `dbt_slim_ci_pr_core`. `TARGET_DIR=target_core` keeps the dbt-core manifest apart from the dbt v2 one:
-
-```bash
-DBT="uvx --python 3.12 --from dbt-core~=1.11.0 --with dbt-postgres~=1.10 dbt" \
-DBT_PROFILES_DIR=profiles_core TARGET_DIR=target_core \
-./slim_ci_demo.sh
-```
-
-```
-== Cause 1: --state and --target-path are the same directory
-  ...
-  Prod manifest copied into target_core/, --state target_core:
-    state:modified -> (nothing)
-    (warning: The state and target directories are the same)
-  ...
-== Cause 2: configs that depend on target.name
-  ...
-  state_modified_compare_more_unrendered_values: false
-    state:modified -> customer_revenue fct_orders
-    state:modified.configs -> customer_revenue fct_orders
-  state_modified_compare_more_unrendered_values: true
-    state:modified -> (nothing)
-    state:modified.configs -> (nothing)
 ```
 
 ### Run Slim CI for real
@@ -160,9 +134,9 @@ dbt selects `state:modified` by comparing each node in the current manifest with
 | `state:modified.macros` | every macro the model calls, directly or through other macros |
 | `state:modified.contract` | its contract |
 
-**Cause 1.** Every dbt command parses the project and writes `manifest.json` to the target path. dbt-core writes it before it reads the `--state` manifest, so with a shared directory it compares the PR with itself. dbt 2.0.11 behaves as if it reads the `--state` manifest first: its first command still works. But the file in `target/` is now the PR's manifest, so any later command in the job, such as a retry, `dbt test` after `dbt run`, or `dbt docs generate` before `dbt build`, compares the PR with itself.
+**Cause 1.** Every dbt command parses the project and writes `manifest.json` to the target path. dbt 2.0.11 behaves as if it reads the `--state` manifest first, so the first command still compares against prod. But the file in `target/` is now the PR's manifest, so any later command in the job, such as a retry, `dbt test` after `dbt run`, or `dbt docs generate` before `dbt build`, compares the PR with itself.
 
-**Cause 2.** dbt stores both the rendered config (`materialized: table` in prod, `view` in CI) and the unrendered one (the Jinja text). Comparing the rendered values flags every target-dependent config. With the flag off, dbt-core 1.11.17 compares unrendered values only for `dbt_project.yml` configs. The flag (added in 1.9) adds configs from `config()` and properties YAML. dbt 2.0.11 always compares unrendered values.
+**Cause 2.** dbt stores both the rendered config (`materialized: table` in prod, `view` in CI) and the unrendered one (the Jinja text). dbt 2.0.11 compares the unrendered one, so a target-dependent config only counts as modified when its Jinja text changes.
 
 **Cause 3.** dbt compares the source of each macro, from `{% macro %}` to `{% endmacro %}`. It can't tell a comment from a change in the SQL the macro generates, so any edit marks every caller. Edits outside the block, such as a comment at the top of the file, aren't part of the macro and don't count.
 
@@ -180,22 +154,13 @@ dbt ls --select state:modified.macros --state prod-state --resource-type model
 | What you see | Likely cause |
 | --- | --- |
 | Nothing, although the PR changes a model | `--state` and `--target-path` are the same directory (cause 1) |
-| `.configs` only, on models with `target.name` in `config()` or YAML | Rendered config comparison (cause 2) |
 | `.macros`, on every model | A macro that every model calls was edited (cause 3) |
-| The same models flagged on every PR, after an upgrade | The prod manifest comes from a different dbt version (see [Notes](#notes)) |
-| `Got a state selector method, but no comparison manifest` (dbt-core) or `Failed to load manifest.json from state path` (dbt v2) | `--state` points at a directory with no `manifest.json` |
+| `Failed to load manifest.json from state path` | `--state` points at a directory with no `manifest.json` |
 
 ## What to do
 
-- **Keep the prod manifest in its own directory.** Download it to `prod-state/`, never to `target/`, and pass `--state prod-state`. On dbt-core, treat `The state and target directories are the same` as an error.
-- **On dbt-core 1.9 to 1.11, turn on the flag:**
-
-  ```yaml
-  flags:
-    state_modified_compare_more_unrendered_values: true
-  ```
-
-  Build the prod manifest with the flag on too. On dbt 2.0.11 the flag isn't needed.
+- **Keep the prod manifest in its own directory.** Download it to `prod-state/`, never to `target/`, and pass `--state prod-state`. dbt 2.0.11 doesn't warn when the two are the same, so check the CI job's paths.
+- **You don't need `state_modified_compare_more_unrendered_values`.** dbt 2.0.11 already compares unrendered configs.
 - **Don't rule out a real macro change.** A full rebuild after a macro edit is usually correct: the SQL of every caller may have changed. Check with `state:modified.macros`, and keep cosmetic edits to widely used macros out of feature PRs. Selecting only `state:modified.body+ state:modified.configs+` would skip a real macro change, so it isn't a fix.
 - **Check that Slim CI selects something.** A Slim CI job that builds nothing passes. Fail the job when a PR changes files under `models/` and `dbt ls --select state:modified` is empty.
 
@@ -208,33 +173,29 @@ dbt ls --select state:modified.macros --state prod-state --resource-type model
    uv run dbt --version   # dbt 2.0.11
    ```
 
-2. **Check `profiles.yml`.** It is included and has two Postgres outputs, `prod` and `ci`, in different schemas. `ci` is the default target:
+2. **Check `profiles.yml`.** It is included and has two Spark Connect outputs, `prod` and `ci`, in different schemas. `ci` is the default target:
 
    ```yaml
    dbt_utils_demo:
      outputs:
        prod:
-         type: postgres
+         type: spark
+         method: spark-connect
          host: localhost
-         port: 5432
-         user: dbt
-         password: secret
-         dbname: dbt_edu
+         port: 15002
          schema: dbt_slim_ci_prod
          threads: 1
        ci:
-         type: postgres
+         type: spark
+         method: spark-connect
          host: localhost
-         port: 5432
-         user: dbt
-         password: secret
-         dbname: dbt_edu
+         port: 15002
          schema: dbt_slim_ci_pr
          threads: 1
      target: ci
    ```
 
-   Change the credentials to match your server.
+   Use a plain `host` and `port`, as above. dbt 2.0.9 needed a workaround (`host: "localhost:15002/;user_id=dbt"` without `port`); dbt 2.0.11 rejects it.
 
 3. **Install dbt packages:**
 
@@ -250,7 +211,7 @@ dbt ls --select state:modified.macros --state prod-state --resource-type model
 DBT_ALLOW_EXPERIMENTAL_ADAPTERS=true
 ```
 
-dbt v2 treats Postgres as an experimental adapter and refuses to run without this flag. If it is missing, dbt fails with `The 'postgres' adapter is not yet supported`.
+dbt v2 treats Spark as an experimental adapter and refuses to run without this flag. If it is missing, dbt fails with `The 'spark' adapter is not yet supported`.
 
 Load it in one of two ways:
 
@@ -272,16 +233,14 @@ Load it in one of two ways:
 
 | Error | Fix |
 | --- | --- |
-| `The state and target directories are the same` | Expected in scenario 1 on dbt-core; in a real job, move the prod manifest out of `target/` |
-| `Got a state selector method, but no comparison manifest` | dbt-core: no `manifest.json` in the `--state` directory |
-| `Failed to load manifest.json from state path` | dbt v2: no `manifest.json` in the `--state` directory |
+| `Failed to load manifest.json from state path` | No `manifest.json` in the `--state` directory |
 | `dbt parse failed` from `slim_ci_demo.sh` | Run `dbt parse --target prod` directly to see the error; usually `env_standard` isn't loaded or `DBT_PROFILES_DIR` isn't set |
-| `The 'postgres' adapter is not yet supported` | `env_standard` isn't loaded; see [Environment variables](#environment-variables) |
+| `The 'spark' adapter is not yet supported` | `env_standard` isn't loaded; see [Environment variables](#environment-variables) |
+| `Could not parse Spark Connect port: strconv.Atoi: parsing "15002/;user_id=dbt"` | The profile still has the dbt 2.0.9 workaround; use `host: localhost` and `port: 15002`; see [Setup](#setup) |
 | `Could not find profile named 'dbt_utils_demo'` | Pass `--profiles-dir .` or set `DBT_PROFILES_DIR` |
 
 ## Notes
 
-- **Compare manifests from the same dbt version.** dbt-core and dbt 2.0.11 store the unrendered `config()` value differently: dbt-core stores a parsed Jinja expression, `Keyword(key='materialized', value=CondExpr(...))`, and dbt 2.0.11 stores the source text. A dbt 2.0.11 CI job compared against a dbt-core prod manifest, or the other way round, flags `fct_orders` on every PR, with the flag on. During an upgrade, rebuild the prod manifest with the new version first.
 - **`state:modified+` adds everything downstream.** In this project the macro edit already selects every model. In a larger one, a macro used by a few staging models selects them and every model built on them.
 
 ## Project layout
@@ -291,17 +250,25 @@ Load it in one of two ways:
 | `slim_ci_demo.sh` | Runs every scenario in a scratch copy of the project and prints what `state:modified` selects |
 | `macros/audit_columns.sql` | The macro every model calls |
 | `models/staging/stg_*.sql` | Staging views over the seeds |
-| `models/marts/*.sql` | Marts; tables in prod and views in CI |
+| `models/marts/*.sql` | Marts; Delta tables in prod and views in CI |
 | `models/marts/marts.yml` | Sets `customer_revenue`'s materialization from `target.name` |
 | `seeds/orders.csv`, `seeds/customers.csv` | Sample data (types pinned in `dbt_project.yml`) |
-| `dbt_project.yml` | `state_modified_compare_more_unrendered_values: true`, and `dim_customers`'s materialization |
+| `dbt_project.yml` | `state_modified_compare_more_unrendered_values` (no effect on dbt 2.0.11), `dim_customers`'s materialization, and `file_format: delta` for the marts |
 | `packages.yml` | dbt package dependencies (`dbt-labs/dbt_utils` 1.x) |
 | `pyproject.toml` / `uv.lock` | Python environment; pins `dbt==2.0.11` |
 | `env_standard` | Environment variables the project needs (see above) |
-| `profiles.yml` | dbt v2 connections: `prod` and `ci` (default) on Postgres, schemas `dbt_slim_ci_prod` and `dbt_slim_ci_pr` |
-| `profiles_core/profiles.yml` | dbt-core 1.x connections, schemas `dbt_slim_ci_prod_core` and `dbt_slim_ci_pr_core` |
+| `profiles.yml` | Connections: `prod` and `ci` (default) on Spark Connect at `localhost:15002`, schemas `dbt_slim_ci_prod` and `dbt_slim_ci_pr` |
 
 ## Prerequisites
 
-- A running Postgres instance (by default `localhost:5432`, database `dbt_edu`). This branch was tested with Postgres 14.
+- A Spark Connect server with Delta Lake on `localhost:15002`. This branch was tested with Spark 4.2.0 and Delta Lake 4.4.1; the Delta version must match the Spark version. For example:
+
+  ```bash
+  $SPARK_HOME/sbin/start-connect-server.sh \
+    --packages org.apache.spark:spark-connect_2.13:4.2.0,io.delta:delta-spark_2.13:4.4.1 \
+    --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
+    --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
+    --conf spark.sql.catalogImplementation=hive
+  ```
+
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)

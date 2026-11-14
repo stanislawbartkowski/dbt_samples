@@ -3,12 +3,12 @@
 # which models `state:modified` selects. Nothing in the repo is changed and
 # nothing is built: `dbt parse` and `dbt ls` only need the manifest.
 #
-#   DBT=dbt ./slim_ci_demo.sh                       # dbt v2 (see README)
-#   DBT="uvx ... dbt" TARGET_DIR=target_core ./slim_ci_demo.sh   # dbt-core 1.x
+#   source .venv/bin/activate; set -a; source env_standard; set +a
+#   ./slim_ci_demo.sh
 set -uo pipefail
 
-DBT=${DBT:-dbt}
-TARGET_DIR=${TARGET_DIR:-target}
+DBT=dbt
+TARGET_DIR=target
 SRC=$(cd "$(dirname "$0")" && pwd)
 export DBT_PROFILES_DIR=${DBT_PROFILES_DIR:-$SRC}
 case $DBT_PROFILES_DIR in /*) ;; *) DBT_PROFILES_DIR=$SRC/$DBT_PROFILES_DIR ;; esac
@@ -47,9 +47,6 @@ modified() {
         echo "    $selector -> ERROR: $(grep -iE 'error' <<<"$out" | head -1 | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-120)"
     else
         echo "    $selector -> (nothing)"
-    fi
-    if grep -q 'state and target directories are the same' <<<"$out"; then
-        echo "    (warning: The state and target directories are the same)"
     fi
 }
 

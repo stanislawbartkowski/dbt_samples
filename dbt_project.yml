@@ -14,10 +14,10 @@ clean-targets:
   - "dbt_packages"
 
 flags:
-  # dbt-core 1.9 to 1.11: compare the unrendered value of configs set in
-  # config() and in properties YAML, so configs that depend on target.name
-  # don't look modified in CI. dbt v2 ignores it and always does this.
-  # slim_ci_demo.sh sets it to false to show the false positive.
+  # Compare the unrendered value of configs set in config() and in properties
+  # YAML, so configs that depend on target.name don't look modified in CI.
+  # dbt 2.0.11 always does this, so the flag has no effect; slim_ci_demo.sh
+  # sets it to false and true to show that.
   state_modified_compare_more_unrendered_values: true
 
 models:
@@ -26,10 +26,12 @@ models:
     marts:
       # Tables in prod, views everywhere else: cheaper CI and dev builds.
       +materialized: "{{ 'table' if target.name == 'prod' else 'view' }}"
+      # Spark builds tables as Delta
+      +file_format: delta
 
 seeds:
   dbt_utils_demo:
-    # Pin the types so dbt-core and dbt v2 build the same columns
+    # Pin the types so the columns don't depend on Spark's type inference
     customers:
       +column_types:
         customer_id: bigint

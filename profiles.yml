@@ -1,21 +1,17 @@
 dbt_utils_demo:
   outputs:
     prod:
-      type: postgres
+      type: spark
+      method: spark-connect
       host: localhost
-      port: 5432
-      user: dbt
-      password: secret
-      dbname: dbt_edu
+      port: 15002
       schema: dbt_slim_ci_prod
       threads: 1
     ci:
-      type: postgres
+      type: spark
+      method: spark-connect
       host: localhost
-      port: 5432
-      user: dbt
-      password: secret
-      dbname: dbt_edu
+      port: 15002
       schema: dbt_slim_ci_pr
       threads: 1
   target: ci
