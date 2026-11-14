@@ -115,11 +115,19 @@ The script only parses. To build:
 dbt build --target prod
 mkdir -p prod-state && cp target/manifest.json prod-state/
 
+# The PR: change one line in fct_orders
+sed -i 's/^    amount,$/    amount,\n    amount * 100 as amount_cents,/' models/marts/fct_orders.sql
+
 # CI job, on the PR branch: build only what changed, and everything downstream
 dbt build --target ci --select state:modified+ --state prod-state
+
+# Undo the change
+git checkout models/marts/fct_orders.sql
 ```
 
-The marts are tables in `dbt_slim_ci_prod` and views in `dbt_slim_ci_pr`.
+The CI job builds `fct_orders` and `customer_revenue`, which is downstream of it. Without the change, it matches nothing and warns `NoNodesSelected`: the project is the same as prod. The marts are tables in `dbt_slim_ci_prod` and views in `dbt_slim_ci_pr`.
+
+On open-source Spark, dbt 2.0.11 also warns `relation_cache: listing schema ... failed` with `REQUIRES_SINGLE_PART_NAMESPACE`. It fills its relation cache by querying `system.information_schema.tables`, which exists only on Databricks. The warning is harmless: the models still build.
 
 ## Why it happens
 
