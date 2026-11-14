@@ -1,0 +1,4 @@
+models:
+  - name: customer_revenue
+    config:
+      materialized: "{{ 'table' if target.name == 'prod' else 'view' }}"

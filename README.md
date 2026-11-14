@@ -1,80 +1,74 @@
-# dbt_utils_demo: numeric precision and enforced contracts
+# dbt_utils_demo: why Slim CI rebuilds more, or less, than it should
 
-This branch tests whether `contract: {enforced: true}` catches a change in a column's numeric precision or scale. The answer depends on the adapter:
+This branch tests three common explanations for a Slim CI job (`dbt build --select state:modified+ --state <prod manifest>`) that rebuilds the whole DAG on every PR. It runs each one on dbt-core 1.11.17 and on dbt 2.0.11:
 
-- **On Postgres, the contract ignores precision and scale.** A contract that says `numeric`, `numeric(38,0)` or `numeric(10,2)` passes against a query that returns `numeric(38,2)`. dbt then builds the table with the contract's type, so the data is rounded or the insert overflows. Both happen after the contract check passed.
-- **On Spark, the contract compares precision and scale exactly.** Every one of those changes fails the contract check before the table is built.
-- **The real failures on Postgres are silent rounding and data-dependent overflow.** `numeric(38,0)` turns `62.49` into `62` with no error and no warning. `numeric(10,2)` builds fine on a small dev sample and fails with `numeric field overflow` only when prod data has a total above 99,999,999.99.
+- **`--state` and `--target-path` in the same directory make Slim CI build too little, not too much.** dbt overwrites the prod manifest with the PR's own manifest, so nothing looks modified and the changed model isn't built at all. dbt-core does this on the first command and prints a warning. dbt 2.0.11 compares correctly on the first command, then overwrites the manifest, so every later command in the same job silently selects nothing.
+- **Configs that depend on `target.name` are false positives only on dbt-core, and only when they're set in `config()` or in properties YAML.** Configs in `dbt_project.yml` are always compared unrendered. `state_modified_compare_more_unrendered_values: true` fixes the rest on dbt-core 1.9 to 1.11. dbt 2.0.11 doesn't have the problem, with or without the flag.
+- **A shared macro edit is the cause that really rebuilds everything.** A comment added inside a macro that every model calls marks every model as `state:modified.macros`, on both versions.
 
-The rule holds on both adapters: **always declare `numeric(precision, scale)`, never bare `numeric` or `decimal`.** But on Postgres a passing contract only means the column names and base types match. To catch rounding, test the values too. This branch includes a test for that: `sum_matches`.
+Diagnose before you change anything: run `dbt ls --select state:modified --state <prod manifest>`, then the sub-selectors (`state:modified.body`, `.configs`, `.macros`, and others) to see *why* each model is selected. See [Diagnose it](#diagnose-it).
 
-This branch uses the same dbt v2 and uv setup as [`concat_macro_overrides`](https://github.com/stanislawbartkowski/dbt_samples/tree/concat_macro_overrides), with two targets: Postgres (the default) and Spark (through Spark Connect) with Delta Lake. dbt-core 1.x runs through `uvx`; nothing extra is installed in the project. See [Setup](#setup) below.
+This branch uses the same dbt v2 and uv setup as [`concat_macro_overrides`](https://github.com/stanislawbartkowski/dbt_samples/tree/concat_macro_overrides), with two Postgres targets: `prod` and `ci`. dbt-core 1.x runs through `uvx`; nothing extra is installed in the project. See [Setup](#setup) below.
 
 ## The problem
 
 A common explanation goes like this:
 
-> Your team enforces `contract: enforced: true` on all mart models, but a PR that changes a column's precision from `numeric(38,2)` to bare `numeric` passes review and only fails at build time in prod. dbt's contract enforcement deliberately does not compare precision or scale, so a contract declared as `data_type: numeric` passes regardless of the actual precision and scale. If `numeric` defaults to precision 38, scale 0, the column becomes integer-only, and if the query produces fractional values, the implicit coercion during table creation fails.
+> Three recurring root causes. First, `--state` and `--target-path` pointing at the same directory: dbt overwrites `target/manifest.json` during parsing before it's used for comparison, so "previous state" has already been overwritten with the current run's manifest by the time dbt diffs — everything looks unmodified or everything looks new, depending on wiring. Second, environment-aware Jinja in configs: if `materialized` branches on `target.name`, the rendered config differs between environments, and older dbt versions compare rendered values — a permanent false positive on every such model. dbt 1.9's `state_modified_compare_more_unrendered_values` flag addresses this. Third, macro-change fan-out: a shared macro edit marks every dependent model as `state:modified.macros`.
 
 Parts of it are right:
 
-- **On Postgres, the contract check doesn't compare precision or scale.** dbt runs the model's SQL and an empty query built from the YAML types, and compares the column types the database reports for each. psycopg2 reports `numeric` for every precision, so `numeric(38,2)` and `numeric(38,0)` look the same.
-- **dbt warns about bare `numeric`.** Both dbt-core 1.11.17 and dbt 2.0.11 print `Detected columns with numeric type and unspecified precision/scale, this can lead to unintended rounding`.
+- **A shared state and target directory loses the prod manifest.** dbt-core even warns about it: `The state and target directories are the same`.
+- **Target-dependent configs are false positives on dbt-core with the flag off**, and the flag fixes them.
+- **A macro edit marks every model that calls the macro**, even when the edit is a comment.
 
 Other parts don't hold:
 
-- **It isn't true for every adapter.** dbt-spark reports the full type, such as `decimal(38,2)`, so on Spark the contract fails on any change in precision or scale.
-- **Bare `numeric` isn't `numeric(38,0)` everywhere.** The default depends on the database. On Postgres, bare `numeric` has no limit, so nothing is rounded. On Spark, `decimal` means `decimal(10,0)`. Precision 38 and scale 0 is Snowflake's default, which this branch doesn't test.
-- **Scale 0 doesn't make the build fail.** On Postgres, inserting `62.49` into `numeric(38,0)` stores `62` and the run succeeds. The build only fails when a value is too large for the precision: a numeric overflow when the data is inserted, not an error in the DDL.
+- **A shared directory never makes everything look new.** It makes everything look unmodified: the PR's change isn't built or tested, and CI passes. A missing prod manifest doesn't rebuild everything either. It's an error on both versions.
+- **It isn't every model with a target-dependent config.** Even with the flag off, dbt-core compares configs set in `dbt_project.yml` unrendered. Only configs set in a model's `config()` block or in properties YAML are compared rendered.
+- **It isn't every dbt version.** dbt 2.0.11 always compares the unrendered value, so the flag changes nothing there.
 
 ## The example
 
-Four table models have the same SQL. `order_total` is always `numeric(38, 2)` in the query (`models/marts/dim_customers.sql`):
+Five models, each calling the macro `audit_columns()` (`macros/audit_columns.sql`):
 
 ```sql
-select
-    c.customer_id,
-    count(o.order_id) as order_count,
-    cast(coalesce(sum(o.amount), 0) as numeric(38, 2)) as order_total
-from {{ ref('customers') }} as c
-left join {{ ref('stg_orders') }} as o
-    on o.customer_id = c.customer_id
-group by c.customer_id
+{% macro audit_columns() -%}
+    current_timestamp as _loaded_at
+{%- endmacro %}
 ```
 
-Only the type of `order_total` in the contract changes (`models/marts/dim_customers.yml`):
+```
+customers ─ stg_customers ─ dim_customers ─┐
+                                           ├─ customer_revenue
+orders ──── stg_orders ──── fct_orders ────┘
+```
 
-| Model | Contract `order_total` | Stands for |
-| --- | --- | --- |
-| `dim_customers` | `numeric(38,2)` | The reviewed contract |
-| `dim_customers_bare_numeric` | `numeric` | The PR: `numeric(38,2)` → bare `numeric` |
-| `dim_customers_scale_0` | `numeric(38,0)` | What bare `numeric` means on Snowflake |
-| `dim_customers_precision_10` | `numeric(10,2)` | Too little precision for the largest totals |
+The three marts are tables in prod and views everywhere else. Each sets that in a different place:
 
-`stg_orders` stands in for dev and prod data. By default it leaves out the one large order (12,345,678,901.25), like a small dev sample. `--vars '{prod_data: true}'` builds on all orders, like prod.
+| Model | Where `materialized` is set |
+| --- | --- |
+| `dim_customers` | `dbt_project.yml`: `+materialized: "{{ 'table' if target.name == 'prod' else 'view' }}"` |
+| `fct_orders` | its own `config()`: `{{ config(materialized="table" if target.name == "prod" else "view") }}` |
+| `customer_revenue` | `models/marts/marts.yml`: `materialized: "{{ 'table' if target.name == 'prod' else 'view' }}"` |
 
-Each `order_total` has a `sum_matches` test, which checks that the column adds up to the same total as `stg_orders.amount`.
+The prod job writes its manifest with `dbt parse --target prod --target-path prod-state`. The CI job lists what Slim CI would build with `dbt ls --target ci --select state:modified --state prod-state`. `slim_ci_demo.sh` runs every scenario in a scratch copy of the project, so the repo isn't changed.
 
 ## Results
 
-| Model | Postgres, dev sample | Postgres, prod data | Spark |
+Each cell lists the models that `state:modified` selects.
+
+| Scenario | Expected | dbt-core 1.11.17 | dbt 2.0.11 |
 | --- | --- | --- | --- |
-| `dim_customers` | succeeds | succeeds | succeeds |
-| `dim_customers_bare_numeric` | succeeds, **warning**; column is unbounded `numeric`, values kept | same | **contract fails:** `decimal(38,2)` ≠ `decimal(10,0)`, plus the warning |
-| `dim_customers_scale_0` | **succeeds silently,** rounds to whole numbers; `sum_matches` fails | same | **contract fails:** `decimal(38,2)` ≠ `decimal(38,0)` |
-| `dim_customers_precision_10` | **succeeds silently** | **fails:** `numeric field overflow` | **contract fails:** `decimal(38,2)` ≠ `decimal(10,2)` |
+| **1.** One-line change to `fct_orders`, `--state prod-state` | `fct_orders` | `fct_orders` | `fct_orders` |
+| **1.** Same change, prod manifest copied into `target/`, `--state target` | `fct_orders` | **nothing**, warning | `fct_orders` |
+| **1.** The next command in the same job, `--state target` | `fct_orders` | **nothing**, warning | **nothing**, no warning |
+| **2.** No change, flag `false` | nothing | **`customer_revenue`, `fct_orders`** (`.configs`) | nothing |
+| **2.** No change, flag `true` | nothing | nothing | nothing |
+| **3.** Jinja comment added inside `audit_columns()` | all five (`.macros`) | all five (`.macros`) | all five (`.macros`) |
+| **3.** Same comment above the `{% macro %}` block | nothing | nothing | nothing |
 
-The results are the same on dbt 2.0.11 and on dbt-core 1.11.17 (dbt-adapters 1.24.5, dbt-postgres 1.11.0, dbt-spark 1.11.0), tested on Postgres 14 and on Spark 4.2.0 with Delta Lake 4.4.1.
-
-`dim_customers_precision_10` is the scenario from the quote: it passes review and the dev build, then fails in prod. `dim_customers_scale_0` is worse: it never fails. Only a test of the values finds it:
-
-```
- customer_id | dim_customers | dim_customers_scale_0
--------------+---------------+-----------------------
-           1 |         62.49 |                    62
-           2 |          5.00 |                     5
-           3 |          7.25 |                     7
-```
+"Flag" is `state_modified_compare_more_unrendered_values` in `dbt_project.yml`. `dim_customers` is never selected in scenario 2: its config comes from `dbt_project.yml`. Tested on Postgres 14.
 
 ### Reproduce it with dbt 2.0.11
 
@@ -83,103 +77,127 @@ source .venv/bin/activate
 set -a; source env_standard; set +a
 export DBT_PROFILES_DIR=.
 dbt deps
-
-# Postgres, dev sample: all four models succeed, one warning, sum_matches fails for scale_0
-dbt build
-
-# Postgres, prod data: dim_customers_precision_10 fails with numeric field overflow
-dbt build --vars '{prod_data: true}'
-
-# Spark: the contract fails for bare_numeric, scale_0 and precision_10
-dbt build --target spark
+./slim_ci_demo.sh
 ```
 
 ```
- Succeeded model dbt_numeric_precision.dim_customers_scale_0 (table) [7 of 11 in 0.15s]
-    Failed test  sum_matches_dim_customers_scale_0_order_total__amount__ref_stg_orders_ (models/marts/dim_customers.yml:50:13) [11 of 11 in 0.02s]
-[warning] [JinjaWarn (dbt1071)]: Detected columns with numeric type and unspecified precision/scale, this can lead to unintended rounding: ['order_total']`
-```
+== Cause 1: --state and --target-path are the same directory
+  The PR changes one line in fct_orders.
+  Separate directories (--state prod-state):
+    state:modified -> fct_orders
+  Prod manifest copied into target/, --state target:
+    state:modified -> fct_orders
+  The next dbt command in the same job, --state target:
+    state:modified -> (nothing)
 
-```
-[error] [DbDriverFailed (dbt1308)]: Database Error in model dim_customers_precision_10 (target/run/dbt_utils_demo/models/marts/dim_customers_precision_10.sql)
-  ERROR:  numeric field overflow
-  DETAIL:  A field with precision 10, scale 2 must round to an absolute value less than 10^8.
-```
+== Cause 2: configs that depend on target.name
+  ...
+  state_modified_compare_more_unrendered_values: false
+    state:modified -> (nothing)
+    state:modified.configs -> (nothing)
+  ...
 
+== Cause 3: a comment added inside a shared macro
+    state:modified -> customer_revenue dim_customers fct_orders stg_customers stg_orders
+    state:modified.body -> (nothing)
+    state:modified.macros -> customer_revenue dim_customers fct_orders stg_customers stg_orders
+  The same comment above the {% macro %} block instead:
+    state:modified -> (nothing)
 ```
-This model has an enforced contract that failed.
-| column_name | definition_type | contract_type |    mismatch_reason |
-| ----------- | --------------- | ------------- | ------------------ |
-| order_total | decimal(38,2)   | decimal(38,0) | data type mismatch |
-```
-
-Check the column types on Postgres:
-
-```bash
-dbt show --inline "select table_name, numeric_precision, numeric_scale from information_schema.columns where table_schema = '{{ target.schema }}' and column_name = 'order_total' order by 1"
-```
-
-`dim_customers_bare_numeric` shows no precision or scale: on Postgres, bare `numeric` has no limit.
 
 ### Reproduce it with dbt-core 1.x
 
-dbt-spark has no Spark Connect method. Its `session` method uses PySpark, which connects to Spark Connect when `SPARK_REMOTE` is set. `profiles_core/profiles.yml` uses that, with the schema `dbt_numeric_precision_core`:
+`profiles_core/profiles.yml` uses the schemas `dbt_slim_ci_prod_core` and `dbt_slim_ci_pr_core`. `TARGET_DIR=target_core` keeps the dbt-core manifest apart from the dbt v2 one:
 
 ```bash
-export SPARK_REMOTE=sc://localhost:15002
-export DBT_PROFILES_DIR=profiles_core
-CORE="uvx --python 3.12 --from dbt-core~=1.11.0 --with dbt-postgres~=1.10 --with dbt-spark[session]~=1.10 --with pyspark[connect]==4.2.0 dbt"
-
-$CORE deps
-$CORE build --target-path target_core
-$CORE build --target-path target_core --vars '{prod_data: true}'
-$CORE build --target-path target_core --target spark
+DBT="uvx --python 3.12 --from dbt-core~=1.11.0 --with dbt-postgres~=1.10 dbt" \
+DBT_PROFILES_DIR=profiles_core TARGET_DIR=target_core \
+./slim_ci_demo.sh
 ```
 
-`--target-path target_core` keeps the dbt-core manifest apart from the dbt v2 one in `target/`.
+```
+== Cause 1: --state and --target-path are the same directory
+  ...
+  Prod manifest copied into target_core/, --state target_core:
+    state:modified -> (nothing)
+    (warning: The state and target directories are the same)
+  ...
+== Cause 2: configs that depend on target.name
+  ...
+  state_modified_compare_more_unrendered_values: false
+    state:modified -> customer_revenue fct_orders
+    state:modified.configs -> customer_revenue fct_orders
+  state_modified_compare_more_unrendered_values: true
+    state:modified -> (nothing)
+    state:modified.configs -> (nothing)
+```
 
-## Why the adapters differ
+### Run Slim CI for real
 
-The contract check is the `assert_columns_equivalent` macro in dbt-adapters. It runs two queries without returning data:
+The script only parses. To build:
 
-1. the model's SQL, and
-2. an empty query built from the YAML, such as `select cast(null as numeric(38,0)) as order_total`.
+```bash
+# Prod job: build, then keep the manifest outside target/
+dbt build --target prod
+mkdir -p prod-state && cp target/manifest.json prod-state/
 
-It asks the database for the column types of each, and compares them as strings.
+# CI job, on the PR branch: build only what changed, and everything downstream
+dbt build --target ci --select state:modified+ --state prod-state
+```
 
-- **Postgres:** dbt-postgres reads the types from the psycopg2 cursor description, which gives a type code. The code for `numeric` is the same for every precision and scale, so both sides become `numeric`. dbt 2.0.11 doesn't use psycopg2, but its comparison drops precision and scale on Postgres too.
-- **Spark:** dbt reads the types from Spark's schema, which includes precision and scale: `decimal(38,2)`.
+The marts are tables in `dbt_slim_ci_prod` and views in `dbt_slim_ci_pr`.
 
-When the check passes, dbt creates the table with the types from the contract, not from the query, and inserts the query's rows into it. Postgres then converts each value to the column's type: it rounds to the column's scale, and fails if the value has too many digits for the precision.
+## Why it happens
+
+dbt selects `state:modified` by comparing each node in the current manifest with the same node in the `--state` manifest. A node is modified when any of these differ, and each has its own sub-selector:
+
+| Sub-selector | Compares |
+| --- | --- |
+| `state:modified.body` | the model's SQL |
+| `state:modified.configs` | its configs |
+| `state:modified.relation` | database, schema, alias |
+| `state:modified.persisted_descriptions` | descriptions, when `persist_docs` is on |
+| `state:modified.macros` | every macro the model calls, directly or through other macros |
+| `state:modified.contract` | its contract |
+
+**Cause 1.** Every dbt command parses the project and writes `manifest.json` to the target path. dbt-core writes it before it reads the `--state` manifest, so with a shared directory it compares the PR with itself. dbt 2.0.11 behaves as if it reads the `--state` manifest first: its first command still works. But the file in `target/` is now the PR's manifest, so any later command in the job, such as a retry, `dbt test` after `dbt run`, or `dbt docs generate` before `dbt build`, compares the PR with itself.
+
+**Cause 2.** dbt stores both the rendered config (`materialized: table` in prod, `view` in CI) and the unrendered one (the Jinja text). Comparing the rendered values flags every target-dependent config. With the flag off, dbt-core 1.11.17 compares unrendered values only for `dbt_project.yml` configs. The flag (added in 1.9) adds configs from `config()` and properties YAML. dbt 2.0.11 always compares unrendered values.
+
+**Cause 3.** dbt compares the source of each macro, from `{% macro %}` to `{% endmacro %}`. It can't tell a comment from a change in the SQL the macro generates, so any edit marks every caller. Edits outside the block, such as a comment at the top of the file, aren't part of the macro and don't count.
+
+## Diagnose it
+
+Before changing the CI job, find out which nodes are selected and why. Compare against a known-good prod manifest:
+
+```bash
+dbt ls --select state:modified --state prod-state --resource-type model
+dbt ls --select state:modified.body --state prod-state --resource-type model
+dbt ls --select state:modified.configs --state prod-state --resource-type model
+dbt ls --select state:modified.macros --state prod-state --resource-type model
+```
+
+| What you see | Likely cause |
+| --- | --- |
+| Nothing, although the PR changes a model | `--state` and `--target-path` are the same directory (cause 1) |
+| `.configs` only, on models with `target.name` in `config()` or YAML | Rendered config comparison (cause 2) |
+| `.macros`, on every model | A macro that every model calls was edited (cause 3) |
+| The same models flagged on every PR, after an upgrade | The prod manifest comes from a different dbt version (see [Notes](#notes)) |
+| `Got a state selector method, but no comparison manifest` (dbt-core) or `Failed to load manifest.json from state path` (dbt v2) | `--state` points at a directory with no `manifest.json` |
 
 ## What to do
 
-- **Always declare precision and scale:** `numeric(38,2)`, never bare `numeric` or `decimal`. Bare types mean something different on every database: no limit on Postgres, `(10,0)` on Spark, `(38,0)` on Snowflake.
-- **Make the warning an error in CI.** dbt only warns about bare `numeric`. Turn that warning into an error:
+- **Keep the prod manifest in its own directory.** Download it to `prod-state/`, never to `target/`, and pass `--state prod-state`. On dbt-core, treat `The state and target directories are the same` as an error.
+- **On dbt-core 1.9 to 1.11, turn on the flag:**
 
-  ```bash
-  dbt build --warn-error-options '{"error": ["JinjaLogWarning"]}'
+  ```yaml
+  flags:
+    state_modified_compare_more_unrendered_values: true
   ```
 
-  This works on dbt-core 1.11.17 and dbt 2.0.11 (which also accepts `JinjaWarn`). It covers every warning raised from Jinja, not only this one.
-- **On Postgres, don't rely on the contract to check precision or scale.** A passing contract means the column names and base types match. Review changes to `data_type` in the YAML as carefully as SQL changes.
-- **Test the values.** A reconciliation test such as `sum_matches` catches rounding that no type check sees. To catch overflow before prod does, make sure the CI data includes the largest values that prod has.
-
-## The `sum_matches` test
-
-`tests/generic/sum_matches.sql` is a generic test that fails when a column doesn't add up to the same total as a column in another model:
-
-```yaml
-      - name: order_total
-        data_type: numeric(38,2)
-        data_tests:
-          - sum_matches:
-              arguments:
-                compare_model: ref('stg_orders')
-                compare_column: amount
-```
-
-It returns one row with both totals when they differ, for example `74` and `74.74` for `dim_customers_scale_0`. Use it where a mart column should keep every cent of its source, such as totals and balances.
+  Build the prod manifest with the flag on too. On dbt 2.0.11 the flag isn't needed.
+- **Don't rule out a real macro change.** A full rebuild after a macro edit is usually correct: the SQL of every caller may have changed. Check with `state:modified.macros`, and keep cosmetic edits to widely used macros out of feature PRs. Selecting only `state:modified.body+ state:modified.configs+` would skip a real macro change, so it isn't a fix.
+- **Check that Slim CI selects something.** A Slim CI job that builds nothing passes. Fail the job when a PR changes files under `models/` and `dbt ls --select state:modified` is empty.
 
 ## Setup
 
@@ -190,31 +208,33 @@ It returns one row with both totals when they differ, for example `74` and `74.7
    uv run dbt --version   # dbt 2.0.11
    ```
 
-2. **Check `profiles.yml`.** It is included and has two outputs. `postgres` is the default target; select Spark with `--target spark`:
+2. **Check `profiles.yml`.** It is included and has two Postgres outputs, `prod` and `ci`, in different schemas. `ci` is the default target:
 
    ```yaml
    dbt_utils_demo:
      outputs:
-       postgres:
+       prod:
          type: postgres
          host: localhost
          port: 5432
          user: dbt
          password: secret
          dbname: dbt_edu
-         schema: dbt_numeric_precision
+         schema: dbt_slim_ci_prod
          threads: 1
-       spark:
-         type: spark
-         method: spark-connect
+       ci:
+         type: postgres
          host: localhost
-         port: 15002
-         schema: dbt_numeric_precision
+         port: 5432
+         user: dbt
+         password: secret
+         dbname: dbt_edu
+         schema: dbt_slim_ci_pr
          threads: 1
-     target: postgres
+     target: ci
    ```
 
-   Change the Postgres credentials to match your server. For Spark, use a plain `host` and `port`, as above. dbt 2.0.9 needed a workaround (`host: "localhost:15002/;user_id=dbt"` without `port`); dbt 2.0.11 rejects it.
+   Change the credentials to match your server.
 
 3. **Install dbt packages:**
 
@@ -230,7 +250,7 @@ It returns one row with both totals when they differ, for example `74` and `74.7
 DBT_ALLOW_EXPERIMENTAL_ADAPTERS=true
 ```
 
-dbt v2 treats Postgres and Spark as experimental adapters and refuses to run without this flag. If it is missing, dbt fails with `The 'postgres' adapter is not yet supported`.
+dbt v2 treats Postgres as an experimental adapter and refuses to run without this flag. If it is missing, dbt fails with `The 'postgres' adapter is not yet supported`.
 
 Load it in one of two ways:
 
@@ -252,47 +272,36 @@ Load it in one of two ways:
 
 | Error | Fix |
 | --- | --- |
-| `numeric field overflow` in `dim_customers_precision_10` | Expected with `--vars '{prod_data: true}'` on Postgres |
-| `This model has an enforced contract that failed` with `data type mismatch` | Expected on Spark for every model except `dim_customers` |
-| `sum_matches_dim_customers_scale_0_...` fails | Expected on Postgres: the contract passed and the values were rounded |
-| `The 'postgres' adapter is not yet supported` (or `'spark'`) | `env_standard` isn't loaded; see [Environment variables](#environment-variables) |
-| `Could not parse Spark Connect port: strconv.Atoi: parsing "15002/;user_id=dbt"` | The profile still has the dbt 2.0.9 workaround; use `host: localhost` and `port: 15002`; see [Setup](#setup) |
-| `Ignored unexpected key "2)"` | A type such as `numeric(38,2)` inside an inline YAML list or map (`[...]`, `{...}`); put it in quotes, or use block YAML |
+| `The state and target directories are the same` | Expected in scenario 1 on dbt-core; in a real job, move the prod manifest out of `target/` |
+| `Got a state selector method, but no comparison manifest` | dbt-core: no `manifest.json` in the `--state` directory |
+| `Failed to load manifest.json from state path` | dbt v2: no `manifest.json` in the `--state` directory |
+| `dbt parse failed` from `slim_ci_demo.sh` | Run `dbt parse --target prod` directly to see the error; usually `env_standard` isn't loaded or `DBT_PROFILES_DIR` isn't set |
+| `The 'postgres' adapter is not yet supported` | `env_standard` isn't loaded; see [Environment variables](#environment-variables) |
 | `Could not find profile named 'dbt_utils_demo'` | Pass `--profiles-dir .` or set `DBT_PROFILES_DIR` |
 
 ## Notes
 
-- **Pin seed types.** dbt-core and dbt 2 infer different types from a CSV seed (for example `integer` versus `bigint`), and so do Postgres and Spark. `dbt_project.yml` pins the types of `seeds/orders.csv` and `seeds/customers.csv` with `column_types`, so the contracts don't depend on type inference.
-- **A failed build can leave the old table behind.** When `dim_customers_precision_10` fails on prod data, the table from the last successful run stays in place, with the data from that run.
-- **`numeric` and `decimal` are the same type** on both Postgres and Spark. The contracts here use `numeric`; Spark reports it as `decimal`.
+- **Compare manifests from the same dbt version.** dbt-core and dbt 2.0.11 store the unrendered `config()` value differently: dbt-core stores a parsed Jinja expression, `Keyword(key='materialized', value=CondExpr(...))`, and dbt 2.0.11 stores the source text. A dbt 2.0.11 CI job compared against a dbt-core prod manifest, or the other way round, flags `fct_orders` on every PR, with the flag on. During an upgrade, rebuild the prod manifest with the new version first.
+- **`state:modified+` adds everything downstream.** In this project the macro edit already selects every model. In a larger one, a macro used by a few staging models selects them and every model built on them.
 
 ## Project layout
 
 | Path | Purpose |
 | --- | --- |
-| `seeds/orders.csv` | Sample orders, including one large order (types pinned in `dbt_project.yml`) |
-| `seeds/customers.csv` | Sample customers |
-| `models/staging/stg_orders.sql` | Orders; leaves out the large order unless `prod_data` is `true` |
-| `models/marts/dim_customers*.sql` | Four models with the same SQL |
-| `models/marts/dim_customers.yml` | Their contracts, which differ only in the type of `order_total` |
-| `tests/generic/sum_matches.sql` | Generic test that compares a column's total with a column in another model |
+| `slim_ci_demo.sh` | Runs every scenario in a scratch copy of the project and prints what `state:modified` selects |
+| `macros/audit_columns.sql` | The macro every model calls |
+| `models/staging/stg_*.sql` | Staging views over the seeds |
+| `models/marts/*.sql` | Marts; tables in prod and views in CI |
+| `models/marts/marts.yml` | Sets `customer_revenue`'s materialization from `target.name` |
+| `seeds/orders.csv`, `seeds/customers.csv` | Sample data (types pinned in `dbt_project.yml`) |
+| `dbt_project.yml` | `state_modified_compare_more_unrendered_values: true`, and `dim_customers`'s materialization |
 | `packages.yml` | dbt package dependencies (`dbt-labs/dbt_utils` 1.x) |
 | `pyproject.toml` / `uv.lock` | Python environment; pins `dbt==2.0.11` |
 | `env_standard` | Environment variables the project needs (see above) |
-| `profiles.yml` | dbt v2 connections: Postgres (default) and Spark Connect on `localhost:15002`, schema `dbt_numeric_precision` |
-| `profiles_core/profiles.yml` | dbt-core 1.x connections: Postgres and Spark through PySpark, schema `dbt_numeric_precision_core` |
+| `profiles.yml` | dbt v2 connections: `prod` and `ci` (default) on Postgres, schemas `dbt_slim_ci_prod` and `dbt_slim_ci_pr` |
+| `profiles_core/profiles.yml` | dbt-core 1.x connections, schemas `dbt_slim_ci_prod_core` and `dbt_slim_ci_pr_core` |
 
 ## Prerequisites
 
 - A running Postgres instance (by default `localhost:5432`, database `dbt_edu`). This branch was tested with Postgres 14.
-- For the Spark target, a Spark Connect server with Delta Lake on `localhost:15002`. This branch was tested with Spark 4.2.0 and Delta Lake 4.4.1; the Delta version must match the Spark version. For example:
-
-  ```bash
-  $SPARK_HOME/sbin/start-connect-server.sh \
-    --packages org.apache.spark:spark-connect_2.13:4.2.0,io.delta:delta-spark_2.13:4.4.1 \
-    --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
-    --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
-    --conf spark.sql.catalogImplementation=hive
-  ```
-
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)

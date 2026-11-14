@@ -13,22 +13,23 @@ clean-targets:
   - "target"
   - "dbt_packages"
 
-vars:
-  # false: the dev sample, without the large order. true: all orders, like prod.
-  prod_data: false
+flags:
+  # dbt-core 1.9 to 1.11: compare the unrendered value of configs set in
+  # config() and in properties YAML, so configs that depend on target.name
+  # don't look modified in CI. dbt v2 ignores it and always does this.
+  # slim_ci_demo.sh sets it to false to show the false positive.
+  state_modified_compare_more_unrendered_values: true
 
 models:
   dbt_utils_demo:
     +materialized: view
     marts:
-      +materialized: table
-      # Spark builds tables as Delta; Postgres ignores file_format
-      +file_format: delta
+      # Tables in prod, views everywhere else: cheaper CI and dev builds.
+      +materialized: "{{ 'table' if target.name == 'prod' else 'view' }}"
 
 seeds:
   dbt_utils_demo:
-    # Pin the types so the contracts don't depend on type inference, which
-    # differs between dbt versions and between Postgres and Spark
+    # Pin the types so dbt-core and dbt v2 build the same columns
     customers:
       +column_types:
         customer_id: bigint

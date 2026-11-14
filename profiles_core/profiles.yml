@@ -1,21 +1,22 @@
-# dbt-core 1.x profile for the comparison run. dbt-spark has no Spark Connect
-# method; "session" uses PySpark, which connects to Spark Connect when
-# SPARK_REMOTE=sc://localhost:15002 is set.
+# dbt-core 1.x profile for the comparison run.
 dbt_utils_demo:
   outputs:
-    postgres:
+    prod:
       type: postgres
       host: localhost
       port: 5432
       user: dbt
       password: secret
       dbname: dbt_edu
-      schema: dbt_numeric_precision_core
+      schema: dbt_slim_ci_prod_core
       threads: 1
-    spark:
-      type: spark
-      method: session
-      host: NA
-      schema: dbt_numeric_precision_core
+    ci:
+      type: postgres
+      host: localhost
+      port: 5432
+      user: dbt
+      password: secret
+      dbname: dbt_edu
+      schema: dbt_slim_ci_pr_core
       threads: 1
-  target: postgres
+  target: ci
