@@ -1,3 +1,12 @@
 {
-  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python"
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+
+  // Integrated terminals: the Python Environments extension loads env_standard into new terminals
+  "python.envFile": "${workspaceFolder}/env_standard",
+  "python.terminal.useEnvFile": true,
+
+  // The dbt extension takes key-value pairs, not a file; keep in sync with env_standard
+  "dbt.environmentVariables": {
+    "DBT_ALLOW_EXPERIMENTAL_ADAPTERS": "true"
+  }
 }
