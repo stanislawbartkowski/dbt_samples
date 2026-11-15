@@ -1,4 +1,15 @@
 models:
-  - name: customer_revenue
-    config:
-      materialized: "{{ 'table' if target.name == 'prod' else 'view' }}"
+  - name: dim_customers
+    columns:
+      - name: customer_id
+        data_tests:
+          - unique
+          - not_null
+  - name: fct_orders
+    columns:
+      - name: customer_id
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('dim_customers')
+                field: customer_id

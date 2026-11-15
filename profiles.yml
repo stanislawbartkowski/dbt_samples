@@ -5,13 +5,13 @@ dbt_utils_demo:
       method: spark-connect
       host: localhost
       port: 15002
-      schema: dbt_slim_ci_prod
+      schema: defer_prod
       threads: 1
-    ci:
+    dev:
       type: spark
       method: spark-connect
       host: localhost
       port: 15002
-      schema: dbt_slim_ci_pr
+      schema: defer_dev_alice
       threads: 1
-  target: ci
+  target: dev

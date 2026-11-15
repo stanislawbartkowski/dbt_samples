@@ -13,19 +13,11 @@ clean-targets:
   - "target"
   - "dbt_packages"
 
-flags:
-  # Compare the unrendered value of configs set in config() and in properties
-  # YAML, so configs that depend on target.name don't look modified in CI.
-  # dbt 2.0.11 always does this, so the flag has no effect; slim_ci_demo.sh
-  # sets it to false and true to show that.
-  state_modified_compare_more_unrendered_values: true
-
 models:
   dbt_utils_demo:
     +materialized: view
     marts:
-      # Tables in prod, views everywhere else: cheaper CI and dev builds.
-      +materialized: "{{ 'table' if target.name == 'prod' else 'view' }}"
+      +materialized: table
       # Spark builds tables as Delta
       +file_format: delta
 
