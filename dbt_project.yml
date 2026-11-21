@@ -17,7 +17,12 @@ models:
   dbt_utils_demo:
     +materialized: view
     marts:
-      +materialized: table
+      # Target-aware materialization: tables in prod, views in CI.
+      # Set here, in dbt_project.yml, because every dbt version compares this
+      # file's unrendered Jinja text. In a model's config() block, dbt-core
+      # 1.11 and older compare the rendered value (table vs view) and mark the
+      # model modified on every PR.
+      +materialized: "{{ 'table' if target.name == 'prod' else 'view' }}"
       # Spark builds tables as Delta
       +file_format: delta
 

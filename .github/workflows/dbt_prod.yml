@@ -1,0 +1,48 @@
+# Production job: build everything on every merge to main, and keep the
+# manifest as an artifact for Slim CI to compare against.
+name: dbt prod
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never run two prod builds at once; queue the next one instead.
+concurrency:
+  group: dbt-prod
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      DBT_PROFILES_DIR: .
+      DBT_ALLOW_EXPERIMENTAL_ADAPTERS: "true"
+      SPARK_CONNECT_HOST: ${{ secrets.SPARK_CONNECT_HOST }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install dbt
+        run: uv sync --frozen
+
+      - name: Install dbt packages
+        run: uv run dbt deps
+
+      - name: Build prod
+        run: uv run ci/prod_deploy.sh
+
+      # Runs only if the build succeeded, so the latest artifact is always
+      # from the last successful prod run.
+      - name: Upload the prod manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-manifest
+          path: target/manifest.json
+          # Slim CI fails once the newest artifact expires; keep it longer
+          # than the longest gap between merges to main.
+          retention-days: 90

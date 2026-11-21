@@ -1,0 +1,76 @@
+# Slim CI: on every pull request, build and test only the models it changes,
+# and everything downstream, in the PR's own schema. Unchanged models are
+# read from prod with --defer.
+name: dbt slim ci
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, closed]
+
+# One run per PR at a time: a new push cancels the run for the old commit,
+# which would otherwise write to the same PR schema.
+concurrency:
+  group: dbt-slim-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read   # to find and download the prod workflow's artifact
+
+env:
+  DBT_PROFILES_DIR: .
+  DBT_ALLOW_EXPERIMENTAL_ADAPTERS: "true"
+  SPARK_CONNECT_HOST: ${{ secrets.SPARK_CONNECT_HOST }}
+  PR_NUMBER: ${{ github.event.pull_request.number }}
+
+jobs:
+  slim-ci:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install dbt
+        run: uv sync --frozen
+
+      - name: Install dbt packages
+        run: uv run dbt deps
+
+      # GitHub Actions keeps no state between workflows. Find the last
+      # successful prod run on main and download its manifest into
+      # prod-state/, outside target/.
+      - name: Download the last successful prod manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow dbt_prod.yml \
+            --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          if [ -z "$run_id" ]; then
+            echo "::error::No successful dbt prod run on main; run the dbt prod workflow first."
+            exit 1
+          fi
+          echo "Using the manifest from prod run $run_id"
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --name prod-manifest --dir prod-state
+
+      - name: Slim CI build
+        run: uv run ci/slim_ci.sh prod-state
+
+  drop-pr-schema:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install dbt
+        run: uv sync --frozen
+
+      - name: Install dbt packages
+        run: uv run dbt deps
+
+      - name: Drop the PR schema
+        run: uv run ci/drop_pr_schema.sh

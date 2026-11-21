@@ -1,17 +1,19 @@
 dbt_utils_demo:
   outputs:
+    # The production job builds here. Slim CI defers unchanged models to it.
     prod:
       type: spark
       method: spark-connect
-      host: localhost
+      host: "{{ env_var('SPARK_CONNECT_HOST', 'localhost') }}"
       port: 15002
-      schema: defer_prod
-      threads: 1
-    dev:
+      schema: slim_gha_prod
+      threads: 4
+    # One schema per pull request: ci/slim_ci.sh sets DBT_CI_SCHEMA=slim_gha_pr_<number>
+    ci:
       type: spark
       method: spark-connect
-      host: localhost
+      host: "{{ env_var('SPARK_CONNECT_HOST', 'localhost') }}"
       port: 15002
-      schema: defer_dev_alice
-      threads: 1
-  target: dev
+      schema: "{{ env_var('DBT_CI_SCHEMA', 'slim_gha_ci') }}"
+      threads: 4
+  target: ci

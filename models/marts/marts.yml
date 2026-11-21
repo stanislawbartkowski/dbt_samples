@@ -13,3 +13,8 @@ models:
               arguments:
                 to: ref('dim_customers')
                 field: customer_id
+  - name: customer_revenue
+    columns:
+      - name: customer_id
+        data_tests:
+          - unique
